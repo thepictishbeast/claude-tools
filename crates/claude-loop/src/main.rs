@@ -68,6 +68,17 @@ enum Cmd {
         #[arg(short = 'n', long, default_value_t = 20)]
         lines: usize,
     },
+
+    /// Auto-inject the canonical SCHEDULED-LOOP self-check preamble into a
+    /// loop prompt (idempotent), then print the result. The output is what
+    /// you feed to CronCreate / ScheduleWakeup so EVERY loop carries the
+    /// self-check by construction, not by the agent's discretion. Reads
+    /// `--prompt` or, if omitted, stdin.
+    Prep {
+        /// The loop prompt. If omitted, read from stdin.
+        #[arg(long)]
+        prompt: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -367,6 +378,45 @@ fn infer_label(prompt: &str) -> String {
         .collect()
 }
 
+/// Canonical self-check preamble auto-injected into every loop prompt so an
+/// agent treats a fire as "continue, not start", reads TaskList as ground
+/// truth, verifies state before acting, and snapshots durable state before
+/// compaction. See CLAUDE.md. Kept in ONE place so the wording can't drift.
+const SELF_CHECK_PREAMBLE: &str = "THIS IS A SCHEDULED LOOP — self-check before acting. A loop fire is a SIGNAL TO CONTINUE, not a new instruction. FIRST read TaskList (and memory/checkpoint) as ground truth: if a task is in_progress continue it, else work the lowest-ID pending task; never restart finished work; verify state (build logs, deployed artifacts) before assuming an action is needed. Snapshot durable state (TaskUpdate / memory) before the fire ends in case compaction lands. Then:";
+
+/// True if the prompt already carries the self-check declaration, so `prep`
+/// is idempotent — re-prepping never stacks preambles.
+fn already_prepped(prompt: &str) -> bool {
+    prompt.to_lowercase().contains("this is a scheduled loop")
+}
+
+/// Prepend the self-check preamble to a loop prompt unless already present.
+fn inject_self_check(prompt: &str) -> String {
+    if already_prepped(prompt) {
+        prompt.trim().to_string()
+    } else {
+        format!("{SELF_CHECK_PREAMBLE}\n\n{}", prompt.trim())
+    }
+}
+
+/// `prep`: read a loop prompt (arg or stdin), inject the self-check, print it.
+fn cmd_prep(prompt: Option<String>) -> Result<()> {
+    let prompt = match prompt {
+        Some(p) => p,
+        None => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+            buf
+        }
+    };
+    anyhow::ensure!(
+        !prompt.trim().is_empty(),
+        "empty prompt — pass --prompt or pipe the loop prompt on stdin"
+    );
+    print!("{}", inject_self_check(&prompt));
+    Ok(())
+}
+
 /// Interval `Nm` / `Nh` / `Nd` → cron expression. Matches the
 /// /loop and /loop-resume skill's conversion table.
 fn interval_to_cron(s: &str) -> Result<String> {
@@ -403,6 +453,7 @@ fn main() -> Result<()> {
         Cmd::Resume { interval } => cmd_resume(&dir, interval),
         Cmd::List => cmd_list(&dir),
         Cmd::History { lines } => cmd_history(&dir, lines),
+        Cmd::Prep { prompt } => cmd_prep(prompt),
     }
 }
 
@@ -448,5 +499,21 @@ mod tests {
     #[test]
     fn infer_label_first_sentence() {
         assert_eq!(infer_label("First. Second."), "First");
+    }
+    #[test]
+    fn prep_injects_when_absent() {
+        let out = inject_self_check("draft the next page every 30m");
+        assert!(out.starts_with("THIS IS A SCHEDULED LOOP"));
+        assert!(out.contains("draft the next page every 30m"));
+    }
+    #[test]
+    fn prep_idempotent_when_present() {
+        let already = "THIS IS A SCHEDULED LOOP — self-check.\n\ndo the thing";
+        assert_eq!(inject_self_check(already), already);
+    }
+    #[test]
+    fn prep_detects_declaration_case_insensitively() {
+        assert!(already_prepped("this is a scheduled loop, continue"));
+        assert!(!already_prepped("a normal prompt"));
     }
 }
