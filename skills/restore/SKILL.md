@@ -74,16 +74,35 @@ Display `$HOME/.claude/.checkpoint/handoff.md` verbatim to the user.
 This is "what we were doing." Lets them sanity-check before
 re-hydrating.
 
-### 4. Re-create the tasks
+### 4. Re-create the tasks (rebuild the full UI task list)
 
-For each entry in `tasks.json`, call `TaskCreate` with the original
-`subject`, `description`, `activeForm`. Set status via `TaskUpdate`
-to match the checkpoint state (in_progress / pending / completed).
+`/clear` and exit wipe the in-flight TaskList from the UI. This step
+puts it back — every task, with descriptions, status, AND the
+blocked/blocked-by graph. Do it in **two passes** so dependencies
+survive the ID renumbering.
 
-**Note**: original task IDs will not be preserved — Claude Code
-assigns new IDs. If a task had `blockedBy: ["3"]`, that "3" refers
-to the old session's ID and won't resolve. Best effort: record the
-old IDs as metadata, but don't try to re-link.
+Each `tasks.json` entry may carry: `id` (the OLD session id),
+`subject`, `description`, `activeForm`, `status`, `blockedBy` (a list
+of OLD ids). Resolve each task's body with a fallback chain:
+`description` → else `note` (older checkpoints used `note`) → else
+reuse `subject`. `TaskCreate` REQUIRES a non-empty description, so
+never pass an empty one — the subject is always a valid last resort.
+
+**Pass 1 — create + status.** Keep a map `oldId -> newId`. For each
+entry: `TaskCreate { subject, description (resolved via the fallback
+chain above), activeForm }`;
+capture the new id from the result; record `map[entry.id] = newId`.
+Then `TaskUpdate { taskId: newId, status }` to match the checkpoint
+(`pending` / `in_progress` / `completed`).
+
+**Pass 2 — re-link dependencies.** For each entry that has a
+`blockedBy` list, translate every old id through the map and call
+`TaskUpdate { taskId: map[entry.id], addBlockedBy: [map[o] for o in entry.blockedBy if o in map] }`.
+Log (don't fail on) any old id missing from the map. This restores
+the dependency graph, not just a flat list.
+
+New ids will differ from the old session's — that's expected and
+fine; the map keeps the graph intact.
 
 ### 5. Resume paused loops
 
