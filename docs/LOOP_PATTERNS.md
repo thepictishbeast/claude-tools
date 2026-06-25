@@ -388,6 +388,60 @@ collaborators.
 
 ---
 
+## Crash-guard + per-iteration checkpointing (stop-on-API-error)
+
+A long-running loop has two failure modes that the bundled `/loop`
+primitive does not handle:
+
+1. **A fire dies mid-iteration** (an API error — most commonly a
+   usage-policy / cybersecurity-classifier block). The cron keeps
+   firing on schedule, so the loop *re-enters the same failure every
+   interval*, which compounds the block and starves the user.
+2. **State is lost across fires** — compaction or a CLI restart wipes
+   the in-session TaskList, and there's no durable per-iteration trail.
+
+`claude-loop` solves both with a per-label append-only status journal
+of `start` / `done` / `halt` events, plus an additive checkpoint per
+fire. Because crons only fire while the REPL is idle, a new fire can't
+begin while the previous one is still running — so a `start` with no
+matching `done` can *only* mean the previous fire died. That unmatched
+`start` is the stop signal.
+
+```
+# STEP 0 of every fire — crash-guard:
+claude-loop guard --label <L>
+#   → {"action":"continue","iter":N}     exit 0  → proceed
+#   → {"action":"halt", ...}             exit 3  → CronDelete this job + STOP
+# (deliberately re-arm a halted loop with:  claude-loop guard --label <L> --reset)
+
+# LAST STEP of every fire (even idle ticks) — additive save-state:
+printf '%s' "$STATE_SUMMARY" | claude-loop checkpoint --label <L> --note "what changed"
+#   → writes ~/.claude/.loop-checkpoints/<L>/checkpoint-<UTCstamp>.md  (NEVER overwritten)
+#   → closes the open iteration, appends INDEX.md, refreshes ENTRYPOINT.md
+```
+
+Wire it in automatically with `prep --label`, which injects both
+instructions (and an explicit "hard-stop on any API error, especially
+a usage-policy block" rule) ahead of the loop prompt:
+
+```sh
+claude-loop prep --label <L> --prompt "$YOUR_LOOP_PROMPT" | <feed to CronCreate>
+```
+
+**Recovery entrypoint.** `~/.claude/.loop-checkpoints/ENTRYPOINT.md`
+is the single canonical "where to look" pointer, rewritten each fire.
+A fresh or recovered session reads it first: it names the loop's
+current status (running / idle / **HALTED**), iteration number, and
+the path to the latest checkpoint + status journal. If status is
+HALTED, the loop stopped on a crash — read the latest checkpoint, fix
+the cause, then re-arm with `--reset`.
+
+This pattern composes with the stop conditions in §1: the crash-guard
+is an *involuntary* stop (the loop died), while §1's conditions are
+*voluntary* (the work is done). A robust loop uses both.
+
+---
+
 ## See also
 
 - `CLAUDE.md` — agent-side instructions for participating in a

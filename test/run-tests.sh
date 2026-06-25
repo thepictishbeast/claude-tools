@@ -455,5 +455,48 @@ else
 fi
 
 echo ""
+echo "[10] loop crash-guard + per-iteration checkpoint (stop-on-API-error)"
+
+# LOOP_PATTERNS must document the crash-guard + checkpoint subcommands.
+if grep -q "claude-loop guard" docs/LOOP_PATTERNS.md; then
+    pass "LOOP_PATTERNS: documents 'claude-loop guard'"
+else
+    fail "LOOP_PATTERNS: missing 'claude-loop guard' crash-guard"
+fi
+if grep -q "claude-loop checkpoint" docs/LOOP_PATTERNS.md; then
+    pass "LOOP_PATTERNS: documents 'claude-loop checkpoint'"
+else
+    fail "LOOP_PATTERNS: missing 'claude-loop checkpoint'"
+fi
+if grep -qF "ENTRYPOINT.md" docs/LOOP_PATTERNS.md; then
+    pass "LOOP_PATTERNS: documents the ENTRYPOINT.md recovery pointer"
+else
+    fail "LOOP_PATTERNS: missing ENTRYPOINT.md recovery pointer"
+fi
+
+# META must list the new subcommands so agents discover them.
+if grep -q "guard" META.md && grep -q "checkpoint" META.md; then
+    pass "META: lists guard + checkpoint subcommands"
+else
+    fail "META: missing guard/checkpoint in binary table"
+fi
+
+# CLAUDE.md doctrine must enforce stop-on-API-error.
+if grep -qiE "stop-on-API-error|usage-policy|One API error = stop" CLAUDE.md; then
+    pass "CLAUDE.md: documents stop-on-API-error doctrine"
+else
+    fail "CLAUDE.md: missing stop-on-API-error doctrine"
+fi
+
+# The binary itself must expose guard + checkpoint (source-level check —
+# no build needed: the Subcommand enum is the contract).
+if grep -q "Guard {" crates/claude-loop/src/main.rs && \
+   grep -q "Checkpoint {" crates/claude-loop/src/main.rs; then
+    pass "claude-loop: Guard + Checkpoint subcommands present in source"
+else
+    fail "claude-loop: missing Guard/Checkpoint subcommands"
+fi
+
+echo ""
 echo "summary: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

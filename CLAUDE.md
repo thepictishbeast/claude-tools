@@ -58,8 +58,38 @@ Rule of thumb: if a future-you in a fresh context would need to know
 what this fire did, write it to disk before the fire ends. Don't
 trust chat history alone.
 
-Tight-tick fires (no state change) skip this — the discipline is for
-substantive iters only.
+Tight-tick fires (no state change) skip the *narrative* handoff — but
+see the crash-guard rule below: when a loop is armed with
+`claude-loop guard`, you still close every fire with a `checkpoint`
+call (it's cheap) so the start/done journal stays balanced.
+
+## Crash-guard + checkpoint every fire (stop-on-API-error)
+
+If this loop was prepped with `claude-loop prep --label <L>` (the
+recommended setup), two calls are MANDATORY every fire — they are how
+the loop survives crashes and an API error doesn't turn into an
+infinite re-fire:
+
+1. **STEP 0, before anything**: `claude-loop guard --label <L>`.
+   - `{"action":"continue"}` (exit 0) → proceed.
+   - `{"action":"halt"}` (exit 3) → the PREVIOUS fire died mid-flight
+     (almost always an API error). **CronDelete this job and STOP.**
+     Do not iterate into the same failure.
+2. **LAST STEP, every fire even idle ticks**: pipe a one-line state
+   summary into `claude-loop checkpoint --label <L> --note "…"`. This
+   writes an additive, never-overwritten `checkpoint-<stamp>.md`,
+   closes the iteration in the journal, and refreshes the canonical
+   `~/.claude/.loop-checkpoints/ENTRYPOINT.md` recovery pointer.
+
+**Hard stop on ANY API error this fire — especially a usage-policy /
+cybersecurity-classifier block.** The instant you hit one, STOP:
+CronDelete the job and do not retry. Re-firing a blocked loop
+compounds the block and prevents the user from working. One API error
+= stop the loop, full stop. Re-arm later (after fixing the cause) with
+`claude-loop guard --label <L> --reset`.
+
+On resume / recovery, read `~/.claude/.loop-checkpoints/ENTRYPOINT.md`
+FIRST — it names the loop's current status and the latest checkpoint.
 
 ## Maintaining the task list
 

@@ -8,7 +8,7 @@
 //! Exit codes:
 //! * 0 — under or at the cap
 //! * 1 — over the cap (suggests retiring lower-leverage skills or
-//!       migrating callable surface to MCP)
+//!   migrating callable surface to MCP)
 //! * 2 — operational error (directory missing, IO failure)
 //!
 //! Usage:

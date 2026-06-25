@@ -18,9 +18,9 @@ use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -78,6 +78,40 @@ enum Cmd {
         /// The loop prompt. If omitted, read from stdin.
         #[arg(long)]
         prompt: Option<String>,
+        /// If set, also inject the crash-guard + per-iteration checkpoint
+        /// enforcement block bound to this loop label.
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Loop crash-guard — call at the START of every loop fire. Reads the
+    /// per-label status journal: if the previous fire left an unmatched
+    /// "start" (the signature of an API error / crash mid-fire), prints
+    /// {"action":"halt"} and exits 3 so the caller STOPS the loop instead of
+    /// iterating into the same failure. Otherwise records a new "start" and
+    /// prints {"action":"continue","iter":N}. Pass --reset to deliberately
+    /// re-arm a halted loop.
+    Guard {
+        /// Loop label (namespaces the status journal + checkpoints).
+        #[arg(long)]
+        label: String,
+        /// Clear a prior halt/open-start and resume from the next iteration.
+        #[arg(long)]
+        reset: bool,
+    },
+
+    /// Additive per-iteration checkpoint — call at the END of every loop fire
+    /// (even idle ticks). Writes a timestamped checkpoint-<stamp>.md (full body
+    /// read from stdin), closes the open iteration in the status journal,
+    /// appends to INDEX.md, and refreshes the canonical ENTRYPOINT.md recovery
+    /// pointer. Checkpoints are NEVER overwritten.
+    Checkpoint {
+        /// Loop label (must match the `guard --label`).
+        #[arg(long)]
+        label: String,
+        /// One-line summary for INDEX.md / ENTRYPOINT.md.
+        #[arg(long)]
+        note: Option<String>,
     },
 }
 
@@ -257,8 +291,7 @@ fn cmd_resume(dir: &std::path::Path, interval_override: Option<String>) -> Resul
         return Ok(());
     }
     let raw = fs::read_to_string(&pp)?;
-    let jobs: Vec<PausedJob> =
-        serde_json::from_str(&raw).context("paused-loops.json malformed")?;
+    let jobs: Vec<PausedJob> = serde_json::from_str(&raw).context("paused-loops.json malformed")?;
     if jobs.is_empty() {
         println!("[]");
         return Ok(());
@@ -399,8 +432,9 @@ fn inject_self_check(prompt: &str) -> String {
     }
 }
 
-/// `prep`: read a loop prompt (arg or stdin), inject the self-check, print it.
-fn cmd_prep(prompt: Option<String>) -> Result<()> {
+/// `prep`: read a loop prompt (arg or stdin), inject the self-check (and, when
+/// `--label` is given, the crash-guard + checkpoint enforcement block), print it.
+fn cmd_prep(prompt: Option<String>, label: Option<String>) -> Result<()> {
     let prompt = match prompt {
         Some(p) => p,
         None => {
@@ -413,7 +447,11 @@ fn cmd_prep(prompt: Option<String>) -> Result<()> {
         !prompt.trim().is_empty(),
         "empty prompt — pass --prompt or pipe the loop prompt on stdin"
     );
-    print!("{}", inject_self_check(&prompt));
+    let mut out = inject_self_check(&prompt);
+    if let Some(label) = label {
+        out = inject_guard(&out, &label);
+    }
+    print!("{}", out);
     Ok(())
 }
 
@@ -444,6 +482,363 @@ fn interval_to_cron(s: &str) -> Result<String> {
     Ok(cron)
 }
 
+// ---------------------------------------------------------------------------
+// Loop crash-guard + additive per-iteration checkpointing.
+//
+// Two behaviours the user requires of every long-running loop:
+//   1. STOP when a previous fire died on an API error (don't iterate into it).
+//   2. SAVE STATE on every iteration, additively (never overwrite a checkpoint).
+// Plus a single canonical ENTRYPOINT.md so a fresh/recovered session knows
+// exactly where to look.
+//
+// Design: a per-label append-only status journal of {start, done, halt}
+// events. A "start" with no matching "done" can ONLY mean the fire that wrote
+// it never finished — and since crons fire only while the REPL is idle, the
+// previous fire is definitively dead (an API error / crash), not merely slow.
+// That unmatched "start" is the stop signal.
+// ---------------------------------------------------------------------------
+
+/// One event in a loop's status journal.
+#[derive(Deserialize, Debug)]
+struct LoopEvent {
+    event: String,
+    #[serde(default)]
+    iter: u64,
+}
+
+fn loop_ckpt_root(dir: &Path) -> PathBuf {
+    dir.join(".loop-checkpoints")
+}
+
+/// Sanitize a label so it can never escape the checkpoints dir.
+fn sanitize_label(label: &str) -> String {
+    let s: String = label
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    // Slashes are already gone (mapped to '_'), so the result is a single path
+    // component. The only remaining traversal risk is a component of exactly
+    // "." or ".." (dots are allowed in labels), so collapse those to a safe name.
+    if s.is_empty() || s == "." || s == ".." {
+        "loop".to_string()
+    } else {
+        s
+    }
+}
+
+fn loop_label_dir(dir: &Path, label: &str) -> PathBuf {
+    loop_ckpt_root(dir).join(sanitize_label(label))
+}
+
+/// Last non-empty event in the status journal, or None if absent/empty.
+fn last_event(path: &Path) -> Result<Option<LoopEvent>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)?;
+    match raw.lines().rev().find(|l| !l.trim().is_empty()) {
+        Some(l) => Ok(Some(
+            serde_json::from_str(l).context("status.jsonl line malformed")?,
+        )),
+        None => Ok(None),
+    }
+}
+
+/// Append one event to a label's status journal under flock.
+fn status_append(dir: &Path, label: &str, ev: &serde_json::Value) -> Result<()> {
+    let ld = loop_label_dir(dir, label);
+    fs::create_dir_all(&ld)?;
+    let lock = File::create(ld.join(".status.lock"))?;
+    lock.lock_exclusive()?;
+    let sp = ld.join("status.jsonl");
+    let mut f = OpenOptions::new().create(true).append(true).open(&sp)?;
+    writeln!(f, "{}", serde_json::to_string(ev)?)?;
+    chmod_600(&sp)?;
+    Ok(())
+}
+
+/// Pure decision: given the last journal event, should this fire continue or
+/// halt, and what iteration number is it? Factored out for testing.
+#[derive(Debug, PartialEq)]
+struct GuardOutcome {
+    halt: bool,
+    iter: u64,
+    /// True when a prior halt/open-start is being deliberately cleared.
+    log_reset: bool,
+}
+
+fn guard_decision(last: Option<&LoopEvent>, reset: bool) -> GuardOutcome {
+    match last {
+        None => GuardOutcome {
+            halt: false,
+            iter: 1,
+            log_reset: false,
+        },
+        Some(e) => match e.event.as_str() {
+            // Previous fire completed cleanly (or was explicitly reset) → continue.
+            "done" | "reset" => GuardOutcome {
+                halt: false,
+                iter: e.iter + 1,
+                log_reset: false,
+            },
+            // Unmatched "start" → previous fire died mid-flight (API error/crash).
+            "start" => {
+                if reset {
+                    GuardOutcome {
+                        halt: false,
+                        iter: e.iter + 1,
+                        log_reset: true,
+                    }
+                } else {
+                    GuardOutcome {
+                        halt: true,
+                        iter: e.iter,
+                        log_reset: false,
+                    }
+                }
+            }
+            // Already halted → stay halted unless explicitly re-armed.
+            "halt" => {
+                if reset {
+                    GuardOutcome {
+                        halt: false,
+                        iter: e.iter + 1,
+                        log_reset: true,
+                    }
+                } else {
+                    GuardOutcome {
+                        halt: true,
+                        iter: e.iter,
+                        log_reset: false,
+                    }
+                }
+            }
+            // Unknown event type → fail safe by continuing.
+            _ => GuardOutcome {
+                halt: false,
+                iter: e.iter + 1,
+                log_reset: false,
+            },
+        },
+    }
+}
+
+/// `guard`: crash-check at the START of a fire.
+fn cmd_guard(dir: &Path, label: String, reset: bool) -> Result<()> {
+    let ld = loop_label_dir(dir, &label);
+    fs::create_dir_all(&ld)?;
+    let sp = ld.join("status.jsonl");
+    let last = last_event(&sp)?;
+    let prev_event = last.as_ref().map(|e| e.event.clone());
+    let outcome = guard_decision(last.as_ref(), reset);
+    let now = Utc::now().to_rfc3339();
+
+    if outcome.halt {
+        let reason = if prev_event.as_deref() == Some("halt") {
+            "loop is HALTED from a prior crash and was not re-armed (pass --reset to resume)"
+        } else {
+            "previous iteration started but never completed — likely an API error / crash mid-fire"
+        };
+        // Record the halt transition once (don't spam on repeated fires).
+        if prev_event.as_deref() == Some("start") {
+            status_append(
+                dir,
+                &label,
+                &serde_json::json!({"event":"halt","at":&now,"iter":outcome.iter,"reason":reason}),
+            )?;
+        }
+        write_entrypoint(dir, &label, "HALTED", outcome.iter, reason)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "action":"halt","iter":outcome.iter,"reason":reason,"label":label
+            }))?
+        );
+        std::process::exit(3);
+    }
+
+    if outcome.log_reset {
+        status_append(
+            dir,
+            &label,
+            &serde_json::json!({"event":"reset","at":&now,"iter":outcome.iter - 1}),
+        )?;
+    }
+    status_append(
+        dir,
+        &label,
+        &serde_json::json!({"event":"start","at":&now,"iter":outcome.iter}),
+    )?;
+    write_entrypoint(
+        dir,
+        &label,
+        "running",
+        outcome.iter,
+        &format!("iteration {} started", outcome.iter),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "action":"continue","iter":outcome.iter,"label":label
+        }))?
+    );
+    Ok(())
+}
+
+/// `checkpoint`: additive save-state at the END of a fire.
+fn cmd_checkpoint(dir: &Path, label: String, note: Option<String>) -> Result<()> {
+    let ld = loop_label_dir(dir, &label);
+    fs::create_dir_all(&ld)?;
+    let sp = ld.join("status.jsonl");
+    let iter = last_event(&sp)?.map(|e| e.iter).unwrap_or(0);
+
+    // Optional full state body on stdin (skip if attached to a terminal so an
+    // interactive invocation never hangs waiting for input).
+    let mut body = String::new();
+    if !std::io::stdin().is_terminal() {
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut body).ok();
+    }
+
+    let now = Utc::now();
+    let stamp = now.format("%Y%m%d-%H%M%SZ").to_string();
+    let nowrfc = now.to_rfc3339();
+    let fname = format!("checkpoint-{stamp}.md");
+    let fpath = ld.join(&fname);
+
+    let mut content = format!("# checkpoint {nowrfc} — label={label} iter={iter}\n\n");
+    if let Some(n) = &note {
+        content.push_str(&format!("**{}**\n\n", n));
+    }
+    if !body.trim().is_empty() {
+        content.push_str(body.trim());
+        content.push('\n');
+    }
+    // Never clobber an existing checkpoint (same-second collision guard).
+    let fpath = if fpath.exists() {
+        ld.join(format!("checkpoint-{stamp}-{}.md", std::process::id()))
+    } else {
+        fpath
+    };
+    fs::write(&fpath, content)?;
+    chmod_600(&fpath)?;
+
+    status_append(
+        dir,
+        &label,
+        &serde_json::json!({"event":"done","at":&nowrfc,"iter":iter,"note":note}),
+    )?;
+    append_index(
+        &ld,
+        &nowrfc,
+        &fpath.file_name().unwrap().to_string_lossy(),
+        note.as_deref().unwrap_or(""),
+    )?;
+    write_entrypoint(
+        dir,
+        &label,
+        "idle",
+        iter,
+        &format!(
+            "iter {iter} checkpointed -> {}",
+            fpath.file_name().unwrap().to_string_lossy()
+        ),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "checkpoint": fpath.file_name().unwrap().to_string_lossy(),
+            "iter": iter,
+            "path": fpath.to_string_lossy(),
+        }))?
+    );
+    Ok(())
+}
+
+/// Append a row to a label's append-only INDEX.md (creates header once).
+fn append_index(ld: &Path, at: &str, fname: &str, note: &str) -> Result<()> {
+    let ip = ld.join("INDEX.md");
+    let header_needed = !ip.exists();
+    let lock = File::create(ld.join(".index.lock"))?;
+    lock.lock_exclusive()?;
+    let mut f = OpenOptions::new().create(true).append(true).open(&ip)?;
+    if header_needed {
+        writeln!(
+            f,
+            "# Checkpoint Index (append-only — newest at bottom)\n\n| at | file | note |\n|---|---|---|"
+        )?;
+    }
+    writeln!(f, "| {} | {} | {} |", at, fname, note.replace('|', "\\|"))?;
+    chmod_600(&ip)?;
+    Ok(())
+}
+
+/// Rewrite the single canonical recovery pointer. This file is derived state
+/// (a pointer), so overwriting it each tick is correct — the checkpoints it
+/// points AT are the additive, never-overwritten source of truth.
+fn write_entrypoint(dir: &Path, label: &str, status: &str, iter: u64, detail: &str) -> Result<()> {
+    let root = loop_ckpt_root(dir);
+    fs::create_dir_all(&root)?;
+    let ep = root.join("ENTRYPOINT.md");
+    let now = Utc::now().to_rfc3339();
+    let ld = loop_label_dir(dir, label);
+    let content = format!(
+        "# LOOP RECOVERY ENTRYPOINT — read this FIRST on any resume\n\n\
+Generated: {now}\n\
+Loop label: `{label}`\n\
+Status: **{status}** (iteration {iter}) — {detail}\n\n\
+## Where to look (in order)\n\
+1. Latest full checkpoint: `ls {ld}/checkpoint-*.md | sort | tail -1`\n\
+2. Per-iteration index:    `{ld}/INDEX.md`\n\
+3. Status journal:         `{ld}/status.jsonl` (last line = current position)\n\
+4. All loops:              `ls {root}/`\n\n\
+## Rule\n\
+If Status is **HALTED**, the loop stopped because a previous fire died (likely an\n\
+API error). Do NOT re-arm blindly: read the latest checkpoint, fix the cause, then\n\
+re-arm — the first fire after re-arming runs `claude-loop guard --label {label} --reset`.\n",
+        now = now,
+        label = label,
+        status = status,
+        iter = iter,
+        detail = detail,
+        ld = ld.display(),
+        root = root.display(),
+    );
+    fs::write(&ep, content)?;
+    chmod_600(&ep)?;
+    Ok(())
+}
+
+/// The crash-guard + checkpoint enforcement block injected into a loop prompt
+/// when `prep --label` is given. Bound to a concrete label so the agent runs
+/// the right state namespace.
+fn guard_block(label: &str) -> String {
+    format!(
+        "LOOP CRASH-GUARD + PER-ITERATION CHECKPOINTING (enforced):\n\
+- STEP 0 (before anything else): run `claude-loop guard --label {label}`. If it prints \"action\":\"halt\" OR exits non-zero, the PREVIOUS fire did not complete — likely an API error. Do NOT continue: CronDelete this job and STOP, then report. (Deliberately re-arm later with `--reset`.)\n\
+- HARD STOP on ANY API error this fire — ESPECIALLY a usage-policy / cybersecurity-classifier block. The instant you hit one, STOP: CronDelete this job and do not retry. Re-firing a blocked loop compounds the block and prevents the user from working. One API error = stop the loop, full stop.\n\
+- LAST STEP (every fire, even idle ticks): pipe a short state summary into `claude-loop checkpoint --label {label} --note \"<one line: what changed>\"`. State is saved ADDITIVELY every iteration; never skip it.\n",
+        label = label
+    )
+}
+
+fn already_guarded(prompt: &str) -> bool {
+    prompt.contains("claude-loop guard --label")
+}
+
+fn inject_guard(prompt: &str, label: &str) -> String {
+    if already_guarded(prompt) {
+        prompt.to_string()
+    } else {
+        format!("{}\n{}", guard_block(label), prompt)
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = state_dir(cli.state_dir.clone())?;
@@ -453,7 +848,9 @@ fn main() -> Result<()> {
         Cmd::Resume { interval } => cmd_resume(&dir, interval),
         Cmd::List => cmd_list(&dir),
         Cmd::History { lines } => cmd_history(&dir, lines),
-        Cmd::Prep { prompt } => cmd_prep(prompt),
+        Cmd::Prep { prompt, label } => cmd_prep(prompt, label),
+        Cmd::Guard { label, reset } => cmd_guard(&dir, label, reset),
+        Cmd::Checkpoint { label, note } => cmd_checkpoint(&dir, label, note),
     }
 }
 
@@ -515,5 +912,135 @@ mod tests {
     fn prep_detects_declaration_case_insensitively() {
         assert!(already_prepped("this is a scheduled loop, continue"));
         assert!(!already_prepped("a normal prompt"));
+    }
+
+    // ---- crash-guard + checkpoint ----
+
+    fn ev(event: &str, iter: u64) -> LoopEvent {
+        LoopEvent {
+            event: event.to_string(),
+            iter,
+        }
+    }
+
+    #[test]
+    fn guard_fresh_journal_continues_at_iter_1() {
+        let o = guard_decision(None, false);
+        assert_eq!(
+            o,
+            GuardOutcome {
+                halt: false,
+                iter: 1,
+                log_reset: false
+            }
+        );
+    }
+
+    #[test]
+    fn guard_after_done_continues_next_iter() {
+        let o = guard_decision(Some(&ev("done", 3)), false);
+        assert!(!o.halt);
+        assert_eq!(o.iter, 4);
+    }
+
+    #[test]
+    fn guard_unmatched_start_halts() {
+        // The core stop-on-API-error rule: a "start" with no "done" means the
+        // previous fire died mid-flight.
+        let o = guard_decision(Some(&ev("start", 5)), false);
+        assert!(o.halt);
+        assert_eq!(o.iter, 5);
+    }
+
+    #[test]
+    fn guard_reset_resumes_from_open_start() {
+        let o = guard_decision(Some(&ev("start", 5)), true);
+        assert!(!o.halt);
+        assert_eq!(o.iter, 6);
+        assert!(o.log_reset);
+    }
+
+    #[test]
+    fn guard_stays_halted_without_reset() {
+        let o = guard_decision(Some(&ev("halt", 2)), false);
+        assert!(o.halt);
+        assert_eq!(o.iter, 2);
+    }
+
+    #[test]
+    fn guard_reset_clears_halt() {
+        let o = guard_decision(Some(&ev("halt", 2)), true);
+        assert!(!o.halt);
+        assert_eq!(o.iter, 3);
+        assert!(o.log_reset);
+    }
+
+    #[test]
+    fn sanitize_label_blocks_traversal() {
+        // Slashes map to '_', so the result is a single, contained component.
+        assert_eq!(sanitize_label("../../etc/passwd"), ".._.._etc_passwd");
+        assert_eq!(sanitize_label("ok.label-1_2"), "ok.label-1_2");
+        assert_eq!(sanitize_label(""), "loop");
+        // A standalone "." / ".." component would still escape → collapsed.
+        assert_eq!(sanitize_label(".."), "loop");
+        assert_eq!(sanitize_label("."), "loop");
+    }
+
+    #[test]
+    fn inject_guard_is_idempotent() {
+        let p = "do the work";
+        let once = inject_guard(p, "demo");
+        assert!(once.contains("claude-loop guard --label demo"));
+        assert!(once.contains("CronDelete this job and STOP"));
+        assert_eq!(inject_guard(&once, "demo"), once); // no double-inject
+    }
+
+    fn unique_tmp() -> PathBuf {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        std::env::temp_dir().join(format!(
+            "claude-loop-test-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::SeqCst)
+        ))
+    }
+
+    #[test]
+    fn checkpoint_cycle_is_additive_and_tracks_state() {
+        let dir = unique_tmp();
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two clean fires.
+        cmd_guard(&dir, "t".into(), false).unwrap();
+        cmd_checkpoint(&dir, "t".into(), Some("first".into())).unwrap();
+        cmd_guard(&dir, "t".into(), false).unwrap();
+        cmd_checkpoint(&dir, "t".into(), Some("second".into())).unwrap();
+
+        let ld = loop_label_dir(&dir, "t");
+        let journal = fs::read_to_string(ld.join("status.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 4, "start,done,start,done");
+
+        let ckpts = fs::read_dir(&ld)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with("checkpoint-"))
+            .count();
+        assert_eq!(
+            ckpts, 2,
+            "every iteration writes its own additive checkpoint"
+        );
+
+        assert!(ld.join("INDEX.md").exists());
+        assert!(loop_ckpt_root(&dir).join("ENTRYPOINT.md").exists());
+
+        // The journal's last event is the most recent "done" → next guard continues.
+        let next = guard_decision(
+            last_event(&ld.join("status.jsonl")).unwrap().as_ref(),
+            false,
+        );
+        assert!(!next.halt);
+        assert_eq!(next.iter, 3);
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

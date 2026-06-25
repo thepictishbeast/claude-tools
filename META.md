@@ -54,7 +54,7 @@ divergent agents.
 ### Binaries (`~/.local/bin/`)
 | Binary | Crate | Purpose |
 |---|---|---|
-| `claude-loop` | `crates/claude-loop` | subcommands `pause` / `resume` / `list` / `history` for `/loop-*` skills |
+| `claude-loop` | `crates/claude-loop` | subcommands `pause` / `resume` / `list` / `history` / `prep` for `/loop-*` skills, plus loop crash-safety: `guard` (stop-on-API-error), `checkpoint` (additive per-iteration save-state) |
 | `file-adr` | `crates/file-adr` | scaffold an ADR (Nygard format) + update index |
 | `audit-unused-dep` | `crates/audit-unused-dep` | find zero-call-site direct deps in a Cargo.toml |
 | `regression-guard` | `crates/regression-guard` | generate a REGRESSION-GUARD test skeleton anchored on a refactor commit |
