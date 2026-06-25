@@ -497,6 +497,29 @@ else
     fail "claude-loop: missing Guard/Checkpoint subcommands"
 fi
 
+# Offline kill-switch: watchdog subcommand + DISABLED handling + wrapper.
+if grep -q "Watchdog {" crates/claude-loop/src/main.rs && \
+   grep -q "fn cmd_watchdog" crates/claude-loop/src/main.rs; then
+    pass "claude-loop: Watchdog subcommand present in source"
+else
+    fail "claude-loop: missing Watchdog subcommand"
+fi
+if grep -q "disabled_path" crates/claude-loop/src/main.rs; then
+    pass "claude-loop: guard honors the DISABLED kill-switch sentinel"
+else
+    fail "claude-loop: missing DISABLED sentinel handling"
+fi
+if [ -f lib/claude-loop-fire.sh ] && sh -n lib/claude-loop-fire.sh; then
+    pass "lib/claude-loop-fire.sh: present + parses (OS-cron local pre-fire gate)"
+else
+    fail "lib/claude-loop-fire.sh: missing or syntax-broken"
+fi
+if grep -q "claude-loop watchdog" docs/LOOP_PATTERNS.md; then
+    pass "LOOP_PATTERNS: documents the offline watchdog kill-switch"
+else
+    fail "LOOP_PATTERNS: missing the watchdog/offline kill-switch"
+fi
+
 echo ""
 echo "summary: $PASS pass, $FAIL fail"
 [ "$FAIL" -eq 0 ]

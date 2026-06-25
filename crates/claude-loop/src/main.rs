@@ -113,6 +113,23 @@ enum Cmd {
         #[arg(long)]
         note: Option<String>,
     },
+
+    /// Local kill-switch — run from an OS timer (cron/systemd), NOT the agent.
+    /// It uses NO API, so it works even when the agent is fully API-blocked. If
+    /// the loop's last journal event is an unmatched "start" older than
+    /// --max-age-secs (a fire that began but never completed — the signature of a
+    /// blocked/crashed agent), it writes a HALT event + a DISABLED sentinel that
+    /// `guard` then honors, stopping the loop locally. Exits 3 when it disables.
+    Watchdog {
+        /// Loop label (must match the `guard --label`).
+        #[arg(long)]
+        label: String,
+        /// Max seconds a fire may be "started" without completing before the loop
+        /// is judged stuck/blocked and DISABLED. Set well above a normal fire's
+        /// duration (e.g. 1800 for a 30-min-cadence loop).
+        #[arg(long, default_value_t = 1800)]
+        max_age_secs: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -504,6 +521,10 @@ struct LoopEvent {
     event: String,
     #[serde(default)]
     iter: u64,
+    /// RFC-3339 timestamp the event was written (used by the watchdog to age out
+    /// an unmatched "start"). Optional for backward-compat with older journals.
+    #[serde(default)]
+    at: Option<String>,
 }
 
 fn loop_ckpt_root(dir: &Path) -> PathBuf {
@@ -534,6 +555,14 @@ fn sanitize_label(label: &str) -> String {
 
 fn loop_label_dir(dir: &Path, label: &str) -> PathBuf {
     loop_ckpt_root(dir).join(sanitize_label(label))
+}
+
+/// Local kill-switch sentinel. Set by `watchdog` (an OS-timer-driven, no-API
+/// process) when a fire is detected stuck/blocked, and honored by `guard` so the
+/// loop stays stopped even when the agent itself is fully API-blocked and cannot
+/// run anything. Cleared by `guard --reset`.
+fn disabled_path(dir: &Path, label: &str) -> PathBuf {
+    loop_label_dir(dir, label).join("DISABLED")
 }
 
 /// Last non-empty event in the status journal, or None if absent/empty.
@@ -634,7 +663,34 @@ fn cmd_guard(dir: &Path, label: String, reset: bool) -> Result<()> {
     let ld = loop_label_dir(dir, &label);
     fs::create_dir_all(&ld)?;
     let sp = ld.join("status.jsonl");
+    let dp = disabled_path(dir, &label);
+    // A deliberate re-arm clears any watchdog DISABLED sentinel first.
+    if reset && dp.exists() {
+        fs::remove_file(&dp).ok();
+    }
     let last = last_event(&sp)?;
+    // Honor the watchdog's local kill-switch: if DISABLED is set (and not being
+    // reset), the loop stays stopped regardless of journal state. This is the
+    // backstop for a TOTAL API block — the agent can't run anything that fire, so
+    // the OS-timer watchdog sets DISABLED and the local pre-fire gate reads it.
+    if dp.exists() {
+        let reason =
+            "loop DISABLED by the watchdog (a prior fire was blocked/crashed) — re-arm with --reset";
+        write_entrypoint(
+            dir,
+            &label,
+            "HALTED",
+            last.as_ref().map(|e| e.iter).unwrap_or(0),
+            reason,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"action":"halt","reason":reason,"label":label})
+            )?
+        );
+        std::process::exit(3);
+    }
     let prev_event = last.as_ref().map(|e| e.event.clone());
     let outcome = guard_decision(last.as_ref(), reset);
     let now = Utc::now().to_rfc3339();
@@ -687,6 +743,70 @@ fn cmd_guard(dir: &Path, label: String, reset: bool) -> Result<()> {
         serde_json::to_string(&serde_json::json!({
             "action":"continue","iter":outcome.iter,"label":label
         }))?
+    );
+    Ok(())
+}
+
+/// Pure: is the loop stuck? True iff the last journal event is an unmatched
+/// "start" whose age exceeds max_age_secs (a fire that began but never wrote its
+/// "done" — the signature of an agent that was blocked/crashed mid-fire).
+fn watchdog_stuck(last: Option<&LoopEvent>, age_secs: i64, max_age_secs: u64) -> bool {
+    matches!(last, Some(e) if e.event == "start") && age_secs > max_age_secs as i64
+}
+
+/// `watchdog`: OS-timer-driven local kill-switch (NO API). See the enum doc.
+fn cmd_watchdog(dir: &Path, label: String, max_age_secs: u64) -> Result<()> {
+    let ld = loop_label_dir(dir, &label);
+    let sp = ld.join("status.jsonl");
+    let dp = disabled_path(dir, &label);
+    if dp.exists() {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"status":"already-disabled","label":label}))?
+        );
+        return Ok(());
+    }
+    let last = last_event(&sp)?;
+    // Age of the last event — only meaningful when it is an unmatched "start".
+    let age_secs: i64 = last
+        .as_ref()
+        .and_then(|e| e.at.as_deref())
+        .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+        .map(|dt| {
+            Utc::now()
+                .signed_duration_since(dt.with_timezone(&Utc))
+                .num_seconds()
+        })
+        .unwrap_or(0);
+
+    if watchdog_stuck(last.as_ref(), age_secs, max_age_secs) {
+        let iter = last.as_ref().map(|e| e.iter).unwrap_or(0);
+        let reason = format!(
+            "watchdog: fire iter {} started {}s ago and never completed (> {}s) — agent blocked/crashed; loop DISABLED locally",
+            iter, age_secs, max_age_secs
+        );
+        fs::create_dir_all(&ld)?;
+        status_append(
+            dir,
+            &label,
+            &serde_json::json!({"event":"halt","at":Utc::now().to_rfc3339(),"iter":iter,"reason":&reason}),
+        )?;
+        fs::write(&dp, format!("{reason}\n"))?;
+        chmod_600(&dp)?;
+        write_entrypoint(dir, &label, "HALTED", iter, &reason)?;
+        println!(
+            "{}",
+            serde_json::to_string(
+                &serde_json::json!({"status":"DISABLED","iter":iter,"age_secs":age_secs,"reason":reason,"label":label})
+            )?
+        );
+        std::process::exit(3);
+    }
+    println!(
+        "{}",
+        serde_json::to_string(
+            &serde_json::json!({"status":"healthy","label":label,"age_secs":age_secs})
+        )?
     );
     Ok(())
 }
@@ -851,6 +971,10 @@ fn main() -> Result<()> {
         Cmd::Prep { prompt, label } => cmd_prep(prompt, label),
         Cmd::Guard { label, reset } => cmd_guard(&dir, label, reset),
         Cmd::Checkpoint { label, note } => cmd_checkpoint(&dir, label, note),
+        Cmd::Watchdog {
+            label,
+            max_age_secs,
+        } => cmd_watchdog(&dir, label, max_age_secs),
     }
 }
 
@@ -920,7 +1044,28 @@ mod tests {
         LoopEvent {
             event: event.to_string(),
             iter,
+            at: None,
         }
+    }
+
+    #[test]
+    fn watchdog_flags_stale_unmatched_start() {
+        // A "start" older than the max age = a fire that began but never finished.
+        assert!(watchdog_stuck(Some(&ev("start", 4)), 2000, 1800));
+    }
+
+    #[test]
+    fn watchdog_ignores_recent_start() {
+        // A "start" within the window is a normal in-progress fire, not stuck.
+        assert!(!watchdog_stuck(Some(&ev("start", 4)), 30, 1800));
+    }
+
+    #[test]
+    fn watchdog_ignores_completed_and_empty() {
+        // A clean "done" (even if old) is not stuck; neither is an empty journal.
+        assert!(!watchdog_stuck(Some(&ev("done", 4)), 999999, 1800));
+        assert!(!watchdog_stuck(Some(&ev("halt", 4)), 999999, 1800));
+        assert!(!watchdog_stuck(None, 999999, 1800));
     }
 
     #[test]

@@ -440,6 +440,47 @@ This pattern composes with the stop conditions in §1: the crash-guard
 is an *involuntary* stop (the loop died), while §1's conditions are
 *voluntary* (the work is done). A robust loop uses both.
 
+### Stopping a loop when the agent is FULLY blocked (offline kill-switch)
+
+The `guard`-at-STEP-0 above runs *inside the agent's fire*. That is enough
+for a crash that kills one fire but leaves the agent able to run later. It is
+NOT enough for a **total** API block (e.g. a usage-policy / cybersecurity
+classifier that flags the whole context): the agent can't run `guard`,
+`CronDelete`, or anything — so an in-memory cron just keeps firing into the
+block and compounds it. The agent cannot save itself.
+
+The fix is a kill-switch that runs **outside** the agent:
+
+- **`claude-loop watchdog --label <L> --max-age-secs N`** — run from an OS
+  timer (cron/systemd), NOT the agent. Uses NO API. If the journal's last
+  event is an unmatched `start` older than N (a fire that began but never
+  completed — the blocked-agent signature), it writes a HALT event + a
+  `DISABLED` sentinel and exits 3. Set N well above a normal fire (e.g. 1200).
+- **`guard` honors `DISABLED`** — once set, every `guard` returns halt until
+  `guard --reset` clears it. So a disabled loop never auto-resumes.
+- **`lib/claude-loop-fire.sh <label> <prompt-file>`** — the missing piece for
+  *true* offline enforcement: drive the loop from an OS timer through this
+  wrapper instead of an in-memory `CronCreate`. It runs `guard` LOCALLY (no
+  API) and only invokes `claude -p` if guard passes. A DISABLED loop is
+  short-circuited before any API call, so a blocked loop physically stops
+  making calls — even with no human and no working agent.
+
+Recommended wiring (OS crontab):
+
+```
+*/30 * * * *  /path/claude-loop-fire.sh myloop /path/prompt.txt   # fire (gated locally)
+*/10 * * * *  claude-loop watchdog --label myloop --max-age-secs 1200  # kill-switch
+```
+
+In the wrapper model the WRAPPER runs `guard`, so build the fire prompt with
+`prep` *without* `--label` (the prompt should only do work + end with
+`checkpoint`); otherwise the agent would double-count the `start`.
+
+In-memory `CronCreate` loops can still use the in-fire `guard` + the watchdog
+(which disables on stuck + alerts), but cannot be physically stopped while the
+agent is blocked — only the OS-cron-wrapper model gives that. Choose the
+wrapper model when unattended/offline resilience matters.
+
 ---
 
 ## See also
