@@ -91,6 +91,18 @@ error. Set up notifications with `claude-loop sentinel --setup` (prompts for an
 email; opt out with `--no-email`). Config: `~/.claude/.sentinel.json`. Run it
 from `dist/systemd/claude-sentinel.{service,timer}` (every 1 min).
 
+Audit read-only with `claude-loop sentinel --scan-only --within-mins <N>`: it
+classifies every recent transcript's API-error (policy vs transient) and prints
+a JSON report — acts on nothing, emails nothing. `test/sentinel-proof.sh` is a
+black-box FP/FN harness (synthetic transcripts, isolated state-dirs, email off).
+Proven 2026-06-30: synthetic corpus 16/16 (0 FP/0 FN) + a real-transcript sweep
+(1,182 transcripts → 186 real policy-blocks vs 996 transient, 0 FP / 0 FN).
+Detection keys on the MESSAGE TEXT (`cybersecurity topic` / `cyber-use-case` /
+`unable to respond to this request` / `violate our usage policy`), never the
+error code (`invalid_request` is generic). Residual FN risk = an unknown FUTURE
+re-wording of the block; the `cyber-use-case` exemption-URL anchor is the most
+stable mitigation (present in every cyber block).
+
 ### Skill-vs-MCP allocation policy (paul 2026-05-21)
 
 > **Cap installed skills at ~15. Beyond that, the discovery + token

@@ -155,6 +155,11 @@ enum Cmd {
         /// KiB of each transcript's tail to scan for the error (transcripts can be huge).
         #[arg(long, default_value_t = 512)]
         tail_kb: u64,
+        /// Read-only audit: classify every recent transcript's API-error and print
+        /// a report. Acts on nothing, emails nothing, exits 0. Use a wide
+        /// --within-mins to sweep history (`sentinel --scan-only --within-mins 100000`).
+        #[arg(long)]
+        scan_only: bool,
     },
 }
 
@@ -1122,6 +1127,40 @@ fn fnv1a(s: &str) -> u64 {
     h
 }
 
+/// Parse one transcript line. If it is an API-error entry
+/// (`isApiErrorMessage:true`), return `(error_code, message, is_policy_block,
+/// entrypoint)` — classifying policy/cyber vs every other (transient) error.
+/// Shared by the live detector and the read-only `--scan-only` audit report.
+fn classify_error_line(line: &str) -> Option<(String, String, bool, String)> {
+    if !line.contains("\"isApiErrorMessage\":true") && !line.contains("\"isApiErrorMessage\": true") {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    let error_code = v
+        .get("error")
+        .and_then(|e| e.as_str())
+        .unwrap_or("api_error")
+        .to_string();
+    let message = extract_error_text(&v).unwrap_or_else(|| error_code.clone());
+    let low = message.to_lowercase();
+    let is_policy = POLICY_SIGNATURES.iter().any(|s| low.contains(s));
+    let entrypoint = v
+        .get("entrypoint")
+        .and_then(|e| e.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some((error_code, message, is_policy, entrypoint))
+}
+
+/// Pure cooldown check (factored out for testing): true if `last_iso` is within
+/// `cooldown_mins` of `now` — i.e. an alert email was sent recently, so suppress.
+fn email_in_cooldown(last_iso: Option<&str>, cooldown_mins: i64, now: chrono::DateTime<Utc>) -> bool {
+    last_iso
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|t| now.signed_duration_since(t.with_timezone(&Utc)).num_minutes() < cooldown_mins)
+        .unwrap_or(false)
+}
+
 /// Scan a transcript's tail for an API-error entry; classify policy-block vs
 /// generic. Returns the most recent (closest to the tail) hit, or None.
 fn detect_api_error(transcript: &Path, tail_kb: u64) -> Option<ApiErrorHit> {
@@ -1354,6 +1393,49 @@ fn send_email(to: &str, subject: &str, body: &str) -> bool {
     false
 }
 
+/// Read-only audit (`--scan-only`): classify the last API-error in every recent
+/// transcript and print a JSON report. No action, no email, no marker, exit 0.
+/// This is the real-world FP/FN instrument — point it at the live ~/.claude
+/// transcripts with a wide --within-mins. `would_alert` = what the live timer
+/// WOULD have done (policy block AND not an ignored sdk-* sub-agent).
+fn sentinel_scan_report(dir: &Path, within_mins: i64, tail_kb: u64) -> Result<()> {
+    let cfg = load_sentinel_config(dir);
+    let roots = projects_roots(dir, &cfg);
+    let mut rows = Vec::new();
+    for t in recent_transcripts(&roots, within_mins) {
+        let Some(raw) = read_tail(&t, tail_kb * 1024) else {
+            continue;
+        };
+        for line in raw.lines().rev() {
+            if let Some((code, msg, is_policy, ep)) = classify_error_line(line) {
+                let sid = t
+                    .file_stem()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let would_alert = is_policy && !(cfg.ignore_sdk && ep.starts_with("sdk"));
+                rows.push(serde_json::json!({
+                    "session": sid, "entrypoint": ep, "error": code,
+                    "policy_block": is_policy, "would_alert": would_alert,
+                    "snippet": msg.chars().take(100).collect::<String>(),
+                }));
+                break; // only the most recent API-error per transcript
+            }
+        }
+    }
+    let policy = rows.iter().filter(|r| r["policy_block"] == serde_json::json!(true)).count();
+    let alert = rows.iter().filter(|r| r["would_alert"] == serde_json::json!(true)).count();
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "scan_only": true, "within_mins": within_mins,
+            "transcripts_with_api_error": rows.len(),
+            "policy_blocks": policy, "would_alert": alert,
+            "rows": rows,
+        }))?
+    );
+    Ok(())
+}
+
 fn cmd_sentinel(
     dir: &Path,
     setup: bool,
@@ -1361,7 +1443,11 @@ fn cmd_sentinel(
     no_email: bool,
     within_mins: i64,
     tail_kb: u64,
+    scan_only: bool,
 ) -> Result<()> {
+    if scan_only {
+        return sentinel_scan_report(dir, within_mins, tail_kb);
+    }
     if setup || email.is_some() || no_email {
         let mut cfg = load_sentinel_config(dir);
         if no_email {
@@ -1460,16 +1546,11 @@ fn cmd_sentinel(
     // the alert EMAIL if we emailed within cooldown_mins, so a recurring block
     // can't spam the inbox. The incident is still recorded by the marker below.
     let cooldown_path = loop_ckpt_root(dir).join(".sentinel-last-email");
-    let in_cooldown = fs::read_to_string(&cooldown_path)
-        .ok()
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
-        .map(|t| {
-            Utc::now()
-                .signed_duration_since(t.with_timezone(&Utc))
-                .num_minutes()
-                < cfg.cooldown_mins
-        })
-        .unwrap_or(false);
+    let in_cooldown = email_in_cooldown(
+        fs::read_to_string(&cooldown_path).ok().as_deref(),
+        cfg.cooldown_mins,
+        Utc::now(),
+    );
     if cfg.email_enabled && !in_cooldown {
         if let Some(addr) = &cfg.email {
             emailed = send_email(
@@ -1524,7 +1605,8 @@ fn main() -> Result<()> {
             no_email,
             within_mins,
             tail_kb,
-        } => cmd_sentinel(&dir, setup, email, no_email, within_mins, tail_kb),
+            scan_only,
+        } => cmd_sentinel(&dir, setup, email, no_email, within_mins, tail_kb, scan_only),
     }
 }
 
@@ -1592,6 +1674,17 @@ mod tests {
     fn sentinel_fn_phrasing_variant_still_caught() {
         // Phrasing variant without "this message" — "cybersecurity topic" still catches it.
         assert_eq!(detect_line("fn1", "{\"message\":{\"content\":[{\"text\":\"API Error: safeguards flagged for a cybersecurity topic.\"}]},\"error\":\"invalid_request\",\"isApiErrorMessage\":true,\"entrypoint\":\"cli\"}"), Some(true));
+    }
+
+    #[test]
+    fn sentinel_cooldown_suppresses_recent_email() {
+        let now = Utc::now();
+        // emailed 1 min ago → within the 120-min cooldown → suppress.
+        assert!(email_in_cooldown(Some(&(now - chrono::Duration::minutes(1)).to_rfc3339()), 120, now));
+        // emailed 3h ago → past cooldown → allow.
+        assert!(!email_in_cooldown(Some(&(now - chrono::Duration::minutes(180)).to_rfc3339()), 120, now));
+        // never emailed → allow.
+        assert!(!email_in_cooldown(None, 120, now));
     }
 
     #[test]
