@@ -1067,8 +1067,9 @@ fn save_sentinel_config(dir: &Path, c: &SentinelConfig) -> Result<()> {
 /// multi-word PHRASES, never broad single words — transient errors (overloaded,
 /// rate-limit, network, auth, malformed) must NOT match or the sentinel spams.
 const POLICY_SIGNATURES: &[&str] = &[
+    "cybersecurity topic", // robust to "flagged this message for a cybersecurity topic" / "flagged for a cybersecurity topic"
+    "cyber-use-case",      // the exemption-form URL fragment — present in every cyber block
     "flagged this message for a cybersecurity",
-    "cyber-use-case",
     "unable to respond to this request",
     "violate our usage policy",
 ];
@@ -1556,6 +1557,41 @@ mod tests {
         std::fs::write(&f, "{\"message\":{\"content\":[{\"text\":\"Not logged in\"}]},\"error\":\"authentication_failed\",\"isApiErrorMessage\":true}\n").unwrap();
         assert!(detect_api_error(&f, 512).is_none(), "non-policy API errors must be ignored");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- false-positive / false-negative boundary corpus (benign inputs only) ---
+    fn detect_line(tag: &str, line: &str) -> Option<bool> {
+        let dir = std::env::temp_dir().join(format!("cl-sx-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl");
+        std::fs::write(&f, format!("{line}\n")).unwrap();
+        let r = detect_api_error(&f, 512).map(|h| h.is_policy_block);
+        let _ = std::fs::remove_dir_all(&dir);
+        r
+    }
+
+    #[test]
+    fn sentinel_fp_flagged_in_billing_not_cyber() {
+        // "flagged" present but not the cyber block — must NOT fire.
+        assert_eq!(detect_line("fp1", "{\"message\":{\"content\":[{\"text\":\"Your payment method was flagged for manual review by billing.\"}]},\"error\":\"invalid_request\",\"isApiErrorMessage\":true,\"entrypoint\":\"cli\"}"), None);
+    }
+
+    #[test]
+    fn sentinel_fp_violates_retry_policy_not_usage() {
+        // "violates"+"policy" present but not "violate our usage policy" — must NOT fire.
+        assert_eq!(detect_line("fp2", "{\"message\":{\"content\":[{\"text\":\"Request rejected: it violates our retry policy, please back off.\"}]},\"error\":\"invalid_request\",\"isApiErrorMessage\":true,\"entrypoint\":\"cli\"}"), None);
+    }
+
+    #[test]
+    fn sentinel_fp_content_mention_is_not_a_block() {
+        // A normal turn that DISCUSSES cybersecurity (no isApiErrorMessage) must NOT fire.
+        assert_eq!(detect_line("fp3", "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Sure — let's discuss the cybersecurity topic and the cyber-use-case exemption form.\"}]}}"), None);
+    }
+
+    #[test]
+    fn sentinel_fn_phrasing_variant_still_caught() {
+        // Phrasing variant without "this message" — "cybersecurity topic" still catches it.
+        assert_eq!(detect_line("fn1", "{\"message\":{\"content\":[{\"text\":\"API Error: safeguards flagged for a cybersecurity topic.\"}]},\"error\":\"invalid_request\",\"isApiErrorMessage\":true,\"entrypoint\":\"cli\"}"), Some(true));
     }
 
     #[test]
