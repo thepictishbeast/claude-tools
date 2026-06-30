@@ -54,7 +54,7 @@ divergent agents.
 ### Binaries (`~/.local/bin/`)
 | Binary | Crate | Purpose |
 |---|---|---|
-| `claude-loop` | `crates/claude-loop` | subcommands `pause` / `resume` / `list` / `history` / `prep` for `/loop-*` skills, plus loop crash-safety: `guard` (stop-on-API-error), `checkpoint` (additive per-iteration save-state), `watchdog` (OS-timer local kill-switch that stops a loop even when the agent is fully API-blocked — pair with `lib/claude-loop-fire.sh`) |
+| `claude-loop` | `crates/claude-loop` | subcommands `pause` / `resume` / `list` / `history` / `prep` for the `loop`/`loops`/`loop-*` skills, plus loop crash-safety: `guard` (stop-on-API-error), `checkpoint` (additive per-iteration save-state), `watchdog` (OS-timer local kill-switch that stops a loop even when the agent is fully API-blocked — pair with `lib/claude-loop-fire.sh`), and `sentinel` (OS-timer API-error sentinel — see below) |
 | `file-adr` | `crates/file-adr` | scaffold an ADR (Nygard format) + update index |
 | `audit-unused-dep` | `crates/audit-unused-dep` | find zero-call-site direct deps in a Cargo.toml |
 | `regression-guard` | `crates/regression-guard` | generate a REGRESSION-GUARD test skeleton anchored on a refactor commit |
@@ -64,6 +64,32 @@ divergent agents.
 one `loop` verb-routed skill 2026-06-30; + `fleet` + `forge`, which defer heavy
 ops to their MCP servers per the prefer-MCP policy). New skills get listed in
 README.md "Tools" section + get a directory under `skills/<name>/SKILL.md`.
+
+### API-error sentinel (`claude-loop sentinel`)
+
+An OS-timer-driven (NO-API) safety net for the recurring usage-policy /
+cybersecurity-classifier block that silently halts a loop. Because it touches no
+API, it works even when the agent is fully blocked. Every minute it scans the
+most-recently-active Claude Code transcript(s) under `<HOME>/.claude/projects/`
+for an `isApiErrorMessage` entry; on the FIRST detection of an incident it:
+
+1. **Stops every running loop** — writes the same `DISABLED` + HALT sentinel the
+   `watchdog` uses (honored by `guard` on the next fire). Caveat: only stops
+   loops that run `guard` at fire-start.
+2. **Backs up the whole conversation** — copies the raw transcript JSONL (the
+   entire conversation Claude Code writes every turn, regardless of whether
+   checkpoint/rewind was ever used) + a `RESUME.md` into
+   `~/.claude/.loop-checkpoints/api-incident-<stamp>/`. `RESUME.md` names
+   `claude --resume <session-id>` as the canonical resume; the copied JSONL is
+   the review/safety fallback.
+3. **Notifies** — desktop toast (`notify-send` / `osascript` / PowerShell,
+   best-effort) + email via the system mailer if enabled.
+
+Idempotent (one action per incident, keyed on session + matched line) and
+recency-gated (`--within-mins`, default 30) so it never re-fires on a historical
+error. Set up notifications with `claude-loop sentinel --setup` (prompts for an
+email; opt out with `--no-email`). Config: `~/.claude/.sentinel.json`. Run it
+from `dist/systemd/claude-sentinel.{service,timer}` (every 1 min).
 
 ### Skill-vs-MCP allocation policy (paul 2026-05-21)
 

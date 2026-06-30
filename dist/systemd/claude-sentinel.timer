@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the Claude Code API-error sentinel every minute
+Documentation=https://github.com/thepictishbeast/claude-tools
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

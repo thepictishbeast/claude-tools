@@ -130,6 +130,32 @@ enum Cmd {
         #[arg(long, default_value_t = 1800)]
         max_age_secs: u64,
     },
+
+    /// API-error sentinel — run from an OS timer (cron/systemd), NOT the agent.
+    /// NO API, so it works even when the agent is fully API-blocked. Scans the
+    /// most-recently-active Claude Code transcript(s) for an API error —
+    /// especially the usage-policy / cybersecurity-classifier block that
+    /// silently halts a loop — and on FIRST detection STOPS every running loop,
+    /// backs up the full conversation transcript + a RESUME.md, and notifies
+    /// (desktop toast + optional email). Idempotent + recency-gated. Run once
+    /// with `--setup` to set the notification email.
+    Sentinel {
+        /// Configure notification prefs (prompts for email if interactive), then exit.
+        #[arg(long)]
+        setup: bool,
+        /// Set the notification email non-interactively (implies email enabled).
+        #[arg(long)]
+        email: Option<String>,
+        /// Disable email notification (desktop toast stays on).
+        #[arg(long)]
+        no_email: bool,
+        /// Only act on a transcript modified within this many minutes (recency gate).
+        #[arg(long, default_value_t = 30)]
+        within_mins: i64,
+        /// KiB of each transcript's tail to scan for the error (transcripts can be huge).
+        #[arg(long, default_value_t = 512)]
+        tail_kb: u64,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -959,6 +985,463 @@ fn inject_guard(prompt: &str, label: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// sentinel — API-error sentinel. OS-timer-driven (NO API): scans the most
+// recently-active Claude Code transcript(s) for an API error — especially the
+// usage-policy / cybersecurity-classifier block that silently halts a loop —
+// and on FIRST detection: (1) STOPS every running loop (DISABLED + HALT, the
+// same machinery the watchdog uses), (2) backs up the FULL conversation
+// transcript (the raw JSONL Claude Code writes every turn — present whether or
+// not checkpoint/rewind was used) + a RESUME.md, (3) notifies via desktop toast
+// + optional email. Idempotent (per-incident marker) + recency-gated so it
+// never re-fires on a historical error or acts on a stale transcript.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Deserialize, Debug)]
+struct SentinelConfig {
+    /// Notification email; None = none on file.
+    #[serde(default)]
+    email: Option<String>,
+    /// Master switch for email (opt-out even with an address on file).
+    #[serde(default)]
+    email_enabled: bool,
+    /// Desktop toast on/off (best-effort; needs a desktop session).
+    #[serde(default = "default_true")]
+    desktop_enabled: bool,
+    /// Extra transcript roots beyond `<state-dir>/projects` (e.g. another
+    /// user's `~/.claude/projects` when loops run under a different account).
+    #[serde(default)]
+    extra_project_roots: Vec<PathBuf>,
+}
+fn default_true() -> bool {
+    true
+}
+impl Default for SentinelConfig {
+    fn default() -> Self {
+        Self {
+            email: None,
+            email_enabled: false,
+            desktop_enabled: true,
+            extra_project_roots: vec![],
+        }
+    }
+}
+
+fn sentinel_config_path(dir: &Path) -> PathBuf {
+    dir.join(".sentinel.json")
+}
+fn load_sentinel_config(dir: &Path) -> SentinelConfig {
+    fs::read_to_string(sentinel_config_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+fn save_sentinel_config(dir: &Path, c: &SentinelConfig) -> Result<()> {
+    let p = sentinel_config_path(dir);
+    fs::write(&p, serde_json::to_string_pretty(c)?)?;
+    chmod_600(&p)?;
+    Ok(())
+}
+
+/// Message-text signatures of the targeted usage-policy / classifier block
+/// (matched lowercased). Broad but anchored — easy to extend as new phrasings
+/// of the block are observed.
+const POLICY_SIGNATURES: &[&str] = &[
+    "usage policy",
+    "unable to respond to this request",
+    "content filtering",
+    "content policy",
+    "cybersecurity",
+    "safety classifier",
+    "flagged",
+    "violate",
+    "prohibited",
+];
+
+struct ApiErrorHit {
+    transcript: PathBuf,
+    session_id: String,
+    error_code: String,
+    message: String,
+    is_policy_block: bool,
+    /// Stable per-incident key (session id + hash of the matched line).
+    key: String,
+}
+
+/// Read at most the last `max_bytes` of a (possibly huge — 500MB+) transcript.
+fn read_tail(path: &Path, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path).ok()?;
+    let len = f.metadata().ok()?.len();
+    f.seek(SeekFrom::Start(len.saturating_sub(max_bytes))).ok()?;
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Recursively pull the first `"text"` string out of a transcript entry.
+fn extract_error_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::Object(m) => {
+            if let Some(serde_json::Value::String(s)) = m.get("text") {
+                return Some(s.clone());
+            }
+            m.values().find_map(extract_error_text)
+        }
+        serde_json::Value::Array(a) => a.iter().find_map(extract_error_text),
+        _ => None,
+    }
+}
+
+/// FNV-1a — a dep-free stable hash for the idempotency key.
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Scan a transcript's tail for an API-error entry; classify policy-block vs
+/// generic. Returns the most recent (closest to the tail) hit, or None.
+fn detect_api_error(transcript: &Path, tail_kb: u64) -> Option<ApiErrorHit> {
+    let raw = read_tail(transcript, tail_kb * 1024)?;
+    for line in raw.lines().rev() {
+        if !line.contains("\"isApiErrorMessage\":true")
+            && !line.contains("\"isApiErrorMessage\": true")
+        {
+            continue;
+        }
+        let v: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => continue, // partial first line from the byte-bounded tail
+        };
+        let error_code = v
+            .get("error")
+            .and_then(|e| e.as_str())
+            .unwrap_or("api_error")
+            .to_string();
+        let message = extract_error_text(&v).unwrap_or_else(|| error_code.clone());
+        let low = message.to_lowercase();
+        let is_policy_block = POLICY_SIGNATURES.iter().any(|s| low.contains(s));
+        let session_id = transcript
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // `key` becomes a marker FILENAME, so derive it from a path-sanitized
+        // form of the session id (the raw id is kept for display / `claude
+        // --resume`, never used to build a path). Self-owned ~/.claude files,
+        // but defensive: sanitize_label collapses any `.`/`..`/separator.
+        let key = format!("{}-{:016x}", sanitize_label(&session_id), fnv1a(line));
+        return Some(ApiErrorHit {
+            transcript: transcript.to_path_buf(),
+            session_id,
+            error_code,
+            message,
+            is_policy_block,
+            key,
+        });
+    }
+    None
+}
+
+fn projects_roots(dir: &Path, cfg: &SentinelConfig) -> Vec<PathBuf> {
+    let mut roots = vec![dir.join("projects")];
+    roots.extend(cfg.extra_project_roots.iter().cloned());
+    roots
+}
+
+/// Transcripts (`<root>/<slug>/*.jsonl`) modified within `within_mins`.
+fn recent_transcripts(roots: &[PathBuf], within_mins: i64) -> Vec<PathBuf> {
+    let cutoff = Utc::now().timestamp() - within_mins.max(0) * 60;
+    let mut out = vec![];
+    for root in roots {
+        let Ok(slugs) = fs::read_dir(root) else {
+            continue;
+        };
+        for slug in slugs.flatten() {
+            let Ok(files) = fs::read_dir(slug.path()) else {
+                continue;
+            };
+            for f in files.flatten() {
+                let p = f.path();
+                if p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let mtime = f
+                    .metadata()
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                if mtime >= cutoff {
+                    out.push((mtime, p));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    out.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Stop every loop whose journal shows an unmatched "start" (a fire in flight),
+/// using the same DISABLED + HALT sentinel the watchdog writes.
+fn stop_all_running_loops(dir: &Path, hit: &ApiErrorHit) -> Result<Vec<String>> {
+    let root = loop_ckpt_root(dir);
+    let mut stopped = vec![];
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Ok(stopped);
+    };
+    for e in entries.flatten() {
+        if !e.path().is_dir() {
+            continue;
+        }
+        let label = e.file_name().to_string_lossy().to_string();
+        if label.starts_with('.') {
+            continue; // skip .sentinel-actioned etc.
+        }
+        let last = last_event(&e.path().join("status.jsonl"))?;
+        let running = matches!(last.as_ref(), Some(ev) if ev.event == "start");
+        let dp = disabled_path(dir, &label);
+        if !running || dp.exists() {
+            continue;
+        }
+        let iter = last.as_ref().map(|ev| ev.iter).unwrap_or(0);
+        let reason = format!(
+            "sentinel: API error ({}) in session {} — loop DISABLED so it can't iterate into the block{}",
+            hit.error_code,
+            hit.session_id,
+            if hit.is_policy_block { " (usage-policy / classifier block)" } else { "" }
+        );
+        status_append(
+            dir,
+            &label,
+            &serde_json::json!({"event":"halt","at":Utc::now().to_rfc3339(),"iter":iter,"reason":&reason}),
+        )?;
+        fs::write(&dp, format!("{reason}\n"))?;
+        chmod_600(&dp).ok();
+        write_entrypoint(dir, &label, "HALTED", iter, &reason)?;
+        stopped.push(label);
+    }
+    Ok(stopped)
+}
+
+/// Copy the full transcript + a RESUME.md into a fresh incident dir. Works
+/// without checkpoint/rewind because the transcript is the raw conversation.
+fn backup_conversation(dir: &Path, hit: &ApiErrorHit, stamp: &str) -> Result<PathBuf> {
+    let bdir = loop_ckpt_root(dir).join(format!("api-incident-{stamp}"));
+    fs::create_dir_all(&bdir)?;
+    let dest = bdir.join("transcript.jsonl");
+    fs::copy(&hit.transcript, &dest).ok();
+    chmod_600(&dest).ok();
+    let resume = bdir.join("RESUME.md");
+    let body = format!(
+        "# API-error incident — {stamp}\n\n\
+A loop/session hit an API error{policy}.\n\n\
+- **Error code:** `{code}`\n\
+- **Message:** {msg}\n\
+- **Session id:** `{sid}`\n\
+- **Original transcript:** `{orig}`\n\
+- **Full backup copy:** `transcript.jsonl` (this dir)\n\n\
+## Resume (canonical)\n\
+Re-attach to the original session — the entire conversation comes back:\n\n\
+```sh\nclaude --resume {sid}\n```\n\n\
+If that session is gone, `transcript.jsonl` here is the complete raw\n\
+conversation (every turn Claude Code wrote, independent of checkpoint/rewind).\n\
+Open it or feed it to a fresh session to review + continue.\n\n\
+## Why the loop stopped\n\
+The sentinel DISABLED all running loops so they don't iterate into the same\n\
+block. Re-arm a fixed loop with `claude-loop guard --label <L> --reset`.\n",
+        policy = if hit.is_policy_block { " (usage-policy / cybersecurity-classifier block)" } else { "" },
+        code = hit.error_code,
+        msg = hit.message.replace('\n', " "),
+        sid = hit.session_id,
+        orig = hit.transcript.display(),
+    );
+    fs::write(&resume, body)?;
+    chmod_600(&resume).ok();
+    Ok(bdir)
+}
+
+/// Best-effort desktop toast (Linux/macOS/Windows). Never fails the run.
+fn desktop_notify(title: &str, body: &str) -> bool {
+    use std::process::Command;
+    let ok = |r: std::io::Result<std::process::ExitStatus>| r.map(|s| s.success()).unwrap_or(false);
+    match std::env::consts::OS {
+        "linux" => ok(Command::new("notify-send")
+            .args(["-u", "critical", title, body])
+            .status()),
+        "macos" => ok(Command::new("osascript")
+            .args([
+                "-e",
+                &format!(
+                    "display notification \"{}\" with title \"{}\"",
+                    body.replace('"', "'"),
+                    title.replace('"', "'")
+                ),
+            ])
+            .status()),
+        "windows" => ok(Command::new("powershell")
+            .args([
+                "-NoProfile",
+                "-Command",
+                &format!(
+                    "New-BurntToastNotification -Text '{}','{}'",
+                    title.replace('\'', "`'"),
+                    body.replace('\'', "`'")
+                ),
+            ])
+            .status()),
+        _ => false,
+    }
+}
+
+/// Best-effort email via the system mailer (`mail`, then `sendmail -t`).
+fn send_email(to: &str, subject: &str, body: &str) -> bool {
+    use std::process::{Command, Stdio};
+    if let Ok(mut c) = Command::new("mail")
+        .arg("-s")
+        .arg(subject)
+        .arg(to)
+        .stdin(Stdio::piped())
+        .spawn()
+    {
+        if let Some(si) = c.stdin.as_mut() {
+            let _ = si.write_all(body.as_bytes());
+        }
+        if c.wait().map(|s| s.success()).unwrap_or(false) {
+            return true;
+        }
+    }
+    if let Ok(mut c) = Command::new("sendmail").arg("-t").stdin(Stdio::piped()).spawn() {
+        if let Some(si) = c.stdin.as_mut() {
+            let _ = si.write_all(format!("To: {to}\nSubject: {subject}\n\n{body}\n").as_bytes());
+        }
+        return c.wait().map(|s| s.success()).unwrap_or(false);
+    }
+    false
+}
+
+fn cmd_sentinel(
+    dir: &Path,
+    setup: bool,
+    email: Option<String>,
+    no_email: bool,
+    within_mins: i64,
+    tail_kb: u64,
+) -> Result<()> {
+    if setup || email.is_some() || no_email {
+        let mut cfg = load_sentinel_config(dir);
+        if no_email {
+            cfg.email_enabled = false;
+        } else if let Some(e) = email {
+            cfg.email = Some(e);
+            cfg.email_enabled = true;
+        } else if std::io::stdin().is_terminal() {
+            print!("Notification email (blank = disable email): ");
+            std::io::stdout().flush().ok();
+            let mut line = String::new();
+            std::io::stdin().read_line(&mut line)?;
+            let e = line.trim();
+            if e.is_empty() {
+                cfg.email_enabled = false;
+            } else {
+                cfg.email = Some(e.to_string());
+                cfg.email_enabled = true;
+            }
+        }
+        save_sentinel_config(dir, &cfg)?;
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "email": cfg.email, "email_enabled": cfg.email_enabled,
+                "desktop_enabled": cfg.desktop_enabled
+            }))?
+        );
+        return Ok(());
+    }
+
+    let cfg = load_sentinel_config(dir);
+    let roots = projects_roots(dir, &cfg);
+    // Prefer a policy block if several recent transcripts carry errors.
+    let mut hit: Option<ApiErrorHit> = None;
+    for t in recent_transcripts(&roots, within_mins) {
+        if let Some(h) = detect_api_error(&t, tail_kb) {
+            let policy = h.is_policy_block;
+            if hit.is_none() || policy {
+                hit = Some(h);
+            }
+            if policy {
+                break;
+            }
+        }
+    }
+    let Some(hit) = hit else {
+        println!("{}", serde_json::to_string(&serde_json::json!({"status":"healthy"}))?);
+        return Ok(());
+    };
+
+    // Idempotency: act once per incident.
+    let marker_dir = loop_ckpt_root(dir).join(".sentinel-actioned");
+    fs::create_dir_all(&marker_dir)?;
+    let marker = marker_dir.join(&hit.key);
+    if marker.exists() {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"status":"already-actioned","key":hit.key}))?
+        );
+        return Ok(());
+    }
+
+    let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let stopped = stop_all_running_loops(dir, &hit)?;
+    let backup = backup_conversation(dir, &hit, &stamp)?;
+    let title = if hit.is_policy_block {
+        "Claude Code blocked (usage-policy)"
+    } else {
+        "Claude Code API error"
+    };
+    let summary = format!(
+        "{} — session {} stopped {} loop(s). Backup + RESUME.md: {}",
+        hit.error_code,
+        hit.session_id,
+        stopped.len(),
+        backup.display()
+    );
+    let mut desktop = false;
+    let mut emailed = false;
+    if cfg.desktop_enabled {
+        desktop = desktop_notify(title, &summary);
+    }
+    if cfg.email_enabled {
+        if let Some(addr) = &cfg.email {
+            emailed = send_email(
+                addr,
+                title,
+                &format!(
+                    "{summary}\n\nMessage:\n{}\n\nResume: claude --resume {}\nBackup dir: {}\n",
+                    hit.message,
+                    hit.session_id,
+                    backup.display()
+                ),
+            );
+        }
+    }
+    fs::write(&marker, format!("actioned {}\n", Utc::now().to_rfc3339()))?;
+    chmod_600(&marker).ok();
+    println!(
+        "{}",
+        serde_json::to_string(&serde_json::json!({
+            "status":"ACTIONED","policy_block":hit.is_policy_block,"error":hit.error_code,
+            "session":hit.session_id,"loops_stopped":stopped,
+            "backup":backup.to_string_lossy(),"notified":{"desktop":desktop,"email":emailed}
+        }))?
+    );
+    std::process::exit(3);
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let dir = state_dir(cli.state_dir.clone())?;
@@ -975,12 +1458,60 @@ fn main() -> Result<()> {
             label,
             max_age_secs,
         } => cmd_watchdog(&dir, label, max_age_secs),
+        Cmd::Sentinel {
+            setup,
+            email,
+            no_email,
+            within_mins,
+            tail_kb,
+        } => cmd_sentinel(&dir, setup, email, no_email, within_mins, tail_kb),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sentinel_detects_policy_block() {
+        let dir = std::env::temp_dir().join(format!("cl-sentinel-a-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("11111111-2222-3333-4444-555555555555.jsonl");
+        std::fs::write(&f, "{\"type\":\"user\"}\n{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"This request appears to violate our Usage Policy.\"}]},\"error\":\"api_error\",\"isApiErrorMessage\":true}\n").unwrap();
+        let hit = detect_api_error(&f, 512).expect("hit");
+        assert!(hit.is_policy_block);
+        assert_eq!(hit.session_id, "11111111-2222-3333-4444-555555555555");
+        assert!(hit.key.starts_with("11111111-2222-3333-4444-555555555555-"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sentinel_classifies_generic_api_error() {
+        let dir = std::env::temp_dir().join(format!("cl-sentinel-b-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("aaaa.jsonl");
+        std::fs::write(&f, "{\"message\":{\"content\":[{\"text\":\"Not logged in\"}]},\"error\":\"authentication_failed\",\"isApiErrorMessage\":true}\n").unwrap();
+        let hit = detect_api_error(&f, 512).expect("hit");
+        assert!(!hit.is_policy_block);
+        assert_eq!(hit.error_code, "authentication_failed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sentinel_ignores_clean_transcript() {
+        let dir = std::env::temp_dir().join(format!("cl-sentinel-c-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("bbbb.jsonl");
+        std::fs::write(&f, "{\"type\":\"assistant\",\"stop_reason\":\"end_turn\"}\n{\"type\":\"user\"}\n").unwrap();
+        assert!(detect_api_error(&f, 512).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sentinel_fnv1a_is_stable() {
+        assert_eq!(fnv1a("abc"), fnv1a("abc"));
+        assert_ne!(fnv1a("abc"), fnv1a("abd"));
+    }
 
     #[test]
     fn interval_5m() {

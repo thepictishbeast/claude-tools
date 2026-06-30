@@ -1,0 +1,15 @@
+[Unit]
+Description=Claude Code API-error sentinel — detect a usage-policy/cybersecurity-classifier block (or any API error) that halts a loop, stop running loops, back up the conversation, and notify.
+Documentation=https://github.com/thepictishbeast/claude-tools
+
+[Service]
+Type=oneshot
+# Runs as root here (this box's loops run as root → state lives in /root/.claude).
+# To watch a different account's loops, set extra_project_roots in
+# <HOME>/.claude/.sentinel.json, or run a per-user copy of this unit.
+Environment=HOME=/root
+ExecStart=/home/paul/.local/bin/claude-loop sentinel
+# exit 3 = "actioned an incident" (by design), not a failure — don't let the
+# timer log it as failed.
+SuccessExitStatus=0 3
+Nice=10
