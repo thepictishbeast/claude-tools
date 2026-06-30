@@ -150,7 +150,7 @@ enum Cmd {
         #[arg(long)]
         no_email: bool,
         /// Only act on a transcript modified within this many minutes (recency gate).
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 10)]
         within_mins: i64,
         /// KiB of each transcript's tail to scan for the error (transcripts can be huge).
         #[arg(long, default_value_t = 512)]
@@ -1012,9 +1012,24 @@ struct SentinelConfig {
     /// user's `~/.claude/projects` when loops run under a different account).
     #[serde(default)]
     extra_project_roots: Vec<PathBuf>,
+    /// Ignore blocks in automated sub-agent / SDK sessions (entrypoint sdk-*).
+    /// Those are transient sub-calls whose parent session owns its own errors;
+    /// alerting on each one is noise (the original spam was sdk-py sub-sessions).
+    /// Default true.
+    #[serde(default = "default_true")]
+    ignore_sdk: bool,
+    /// Global alert-email cooldown (minutes): after one alert email, suppress
+    /// further alert EMAILS for this long. Blocks are still backed up + loops
+    /// stopped silently — only the EMAIL is rate-limited, so a recurring block
+    /// can't spam. Default 120.
+    #[serde(default = "default_cooldown")]
+    cooldown_mins: i64,
 }
 fn default_true() -> bool {
     true
+}
+fn default_cooldown() -> i64 {
+    120
 }
 impl Default for SentinelConfig {
     fn default() -> Self {
@@ -1023,6 +1038,8 @@ impl Default for SentinelConfig {
             email_enabled: false,
             desktop_enabled: true,
             extra_project_roots: vec![],
+            ignore_sdk: true,
+            cooldown_mins: 120,
         }
     }
 }
@@ -1043,24 +1060,25 @@ fn save_sentinel_config(dir: &Path, c: &SentinelConfig) -> Result<()> {
     Ok(())
 }
 
-/// Message-text signatures of the targeted usage-policy / classifier block
-/// (matched lowercased). Broad but anchored — easy to extend as new phrasings
-/// of the block are observed.
+/// Distinctive message-text signatures of the SPECIFIC block this sentinel
+/// exists for (matched lowercased): the cybersecurity-safeguard block
+/// ("...safeguards flagged this message for a cybersecurity topic ... apply for
+/// an exemption: .../cyber-use-case") and the usage-policy block. Deliberately
+/// multi-word PHRASES, never broad single words — transient errors (overloaded,
+/// rate-limit, network, auth, malformed) must NOT match or the sentinel spams.
 const POLICY_SIGNATURES: &[&str] = &[
-    "usage policy",
+    "flagged this message for a cybersecurity",
+    "cyber-use-case",
     "unable to respond to this request",
-    "content filtering",
-    "content policy",
-    "cybersecurity",
-    "safety classifier",
-    "flagged",
-    "violate",
-    "prohibited",
+    "violate our usage policy",
 ];
 
 struct ApiErrorHit {
     transcript: PathBuf,
     session_id: String,
+    /// Claude Code entrypoint that hit the error: "cli" (interactive / loop
+    /// fire) vs "sdk-py"/"sdk-cli" (automated sub-agent / SDK call).
+    entrypoint: String,
     error_code: String,
     message: String,
     is_policy_block: bool,
@@ -1125,18 +1143,29 @@ fn detect_api_error(transcript: &Path, tail_kb: u64) -> Option<ApiErrorHit> {
         let message = extract_error_text(&v).unwrap_or_else(|| error_code.clone());
         let low = message.to_lowercase();
         let is_policy_block = POLICY_SIGNATURES.iter().any(|s| low.contains(s));
+        // This sentinel exists for the policy / cyber-safeguard block ONLY.
+        // Every other API error (overloaded, rate-limit, network, auth,
+        // malformed) is transient / self-recovering and must NEVER alert —
+        // skip it and keep scanning earlier lines for a real policy block.
+        if !is_policy_block {
+            continue;
+        }
+        let entrypoint = v
+            .get("entrypoint")
+            .and_then(|e| e.as_str())
+            .unwrap_or("")
+            .to_string();
         let session_id = transcript
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
         // `key` becomes a marker FILENAME, so derive it from a path-sanitized
-        // form of the session id (the raw id is kept for display / `claude
-        // --resume`, never used to build a path). Self-owned ~/.claude files,
-        // but defensive: sanitize_label collapses any `.`/`..`/separator.
+        // form of the session id (raw id kept for display / `claude --resume`).
         let key = format!("{}-{:016x}", sanitize_label(&session_id), fnv1a(line));
         return Some(ApiErrorHit {
             transcript: transcript.to_path_buf(),
             session_id,
+            entrypoint,
             error_code,
             message,
             is_policy_block,
@@ -1383,6 +1412,17 @@ fn cmd_sentinel(
         return Ok(());
     };
 
+    // Ignore automated sub-agent / SDK sessions (entrypoint sdk-*): a block in
+    // a transient sub-call is not the operator's loop/conversation, and alerting
+    // on each is noise — the original 7-email spam was all sdk-py sub-sessions.
+    if cfg.ignore_sdk && hit.entrypoint.starts_with("sdk") {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"status":"ignored-sdk-subagent","entrypoint":hit.entrypoint,"session":hit.session_id}))?
+        );
+        return Ok(());
+    }
+
     // Idempotency: act once per incident.
     let marker_dir = loop_ckpt_root(dir).join(".sentinel-actioned");
     fs::create_dir_all(&marker_dir)?;
@@ -1415,7 +1455,21 @@ fn cmd_sentinel(
     if cfg.desktop_enabled {
         desktop = desktop_notify(title, &summary);
     }
-    if cfg.email_enabled {
+    // Global email cooldown: the backup + loop-stop ALWAYS happen, but suppress
+    // the alert EMAIL if we emailed within cooldown_mins, so a recurring block
+    // can't spam the inbox. The incident is still recorded by the marker below.
+    let cooldown_path = loop_ckpt_root(dir).join(".sentinel-last-email");
+    let in_cooldown = fs::read_to_string(&cooldown_path)
+        .ok()
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|t| {
+            Utc::now()
+                .signed_duration_since(t.with_timezone(&Utc))
+                .num_minutes()
+                < cfg.cooldown_mins
+        })
+        .unwrap_or(false);
+    if cfg.email_enabled && !in_cooldown {
         if let Some(addr) = &cfg.email {
             emailed = send_email(
                 addr,
@@ -1427,6 +1481,10 @@ fn cmd_sentinel(
                     backup.display()
                 ),
             );
+            if emailed {
+                let _ = fs::write(&cooldown_path, Utc::now().to_rfc3339());
+                chmod_600(&cooldown_path).ok();
+            }
         }
     }
     fs::write(&marker, format!("actioned {}\n", Utc::now().to_rfc3339()))?;
@@ -1436,7 +1494,8 @@ fn cmd_sentinel(
         serde_json::to_string(&serde_json::json!({
             "status":"ACTIONED","policy_block":hit.is_policy_block,"error":hit.error_code,
             "session":hit.session_id,"loops_stopped":stopped,
-            "backup":backup.to_string_lossy(),"notified":{"desktop":desktop,"email":emailed}
+            "backup":backup.to_string_lossy(),"entrypoint":hit.entrypoint,
+            "notified":{"desktop":desktop,"email":emailed,"email_suppressed_cooldown":in_cooldown}
         }))?
     );
     std::process::exit(3);
@@ -1477,23 +1536,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("cl-sentinel-a-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("11111111-2222-3333-4444-555555555555.jsonl");
-        std::fs::write(&f, "{\"type\":\"user\"}\n{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"This request appears to violate our Usage Policy.\"}]},\"error\":\"api_error\",\"isApiErrorMessage\":true}\n").unwrap();
+        // The REAL cybersecurity-safeguard block shape (entrypoint sdk-py).
+        std::fs::write(&f, "{\"type\":\"user\"}\n{\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"API Error: Opus 4.7's safeguards flagged this message for a cybersecurity topic. Apply for an exemption: https://claude.com/form/cyber-use-case?token=x\"}]},\"error\":\"invalid_request\",\"isApiErrorMessage\":true,\"entrypoint\":\"sdk-py\"}\n").unwrap();
         let hit = detect_api_error(&f, 512).expect("hit");
         assert!(hit.is_policy_block);
+        assert_eq!(hit.entrypoint, "sdk-py");
         assert_eq!(hit.session_id, "11111111-2222-3333-4444-555555555555");
         assert!(hit.key.starts_with("11111111-2222-3333-4444-555555555555-"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn sentinel_classifies_generic_api_error() {
+    fn sentinel_ignores_non_policy_api_error() {
         let dir = std::env::temp_dir().join(format!("cl-sentinel-b-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("aaaa.jsonl");
+        // A transient/auth API error is NOT the policy block — must be ignored
+        // entirely (this is what stopped the spam: only policy blocks act).
         std::fs::write(&f, "{\"message\":{\"content\":[{\"text\":\"Not logged in\"}]},\"error\":\"authentication_failed\",\"isApiErrorMessage\":true}\n").unwrap();
-        let hit = detect_api_error(&f, 512).expect("hit");
-        assert!(!hit.is_policy_block);
-        assert_eq!(hit.error_code, "authentication_failed");
+        assert!(detect_api_error(&f, 512).is_none(), "non-policy API errors must be ignored");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
