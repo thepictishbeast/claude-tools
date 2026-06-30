@@ -60,8 +60,10 @@ divergent agents.
 | `regression-guard` | `crates/regression-guard` | generate a REGRESSION-GUARD test skeleton anchored on a refactor commit |
 
 ### Skills (`~/.claude/skills/`)
-14 skills total. New skills get listed in README.md "Tools" section
-+ get a directory under `skills/<name>/SKILL.md`.
+15 skills total (loop-pause/resume/edit/stop/track/update consolidated into
+one `loop` verb-routed skill 2026-06-30; + `fleet` + `forge`, which defer heavy
+ops to their MCP servers per the prefer-MCP policy). New skills get listed in
+README.md "Tools" section + get a directory under `skills/<name>/SKILL.md`.
 
 ### Skill-vs-MCP allocation policy (paul 2026-05-21)
 
