@@ -1367,26 +1367,113 @@ fn desktop_notify(title: &str, body: &str) -> bool {
     }
 }
 
-/// Best-effort email via the system mailer (`mail`, then `sendmail -t`).
-fn send_email(to: &str, subject: &str, body: &str) -> bool {
-    use std::process::{Command, Stdio};
-    if let Ok(mut c) = Command::new("mail")
-        .arg("-s")
-        .arg(subject)
-        .arg(to)
-        .stdin(Stdio::piped())
-        .spawn()
-    {
-        if let Some(si) = c.stdin.as_mut() {
-            let _ = si.write_all(body.as_bytes());
-        }
-        if c.wait().map(|s| s.success()).unwrap_or(false) {
-            return true;
+// --- polished internal email (multipart/alternative HTML + text fallback) ---
+// Reusable renderer: nice card layout, inline CSS (email clients strip <style>),
+// clear accent header, KV details, a copyable monospace code block, numbered
+// steps, and bulletproof link buttons. Not log-dump plaintext.
+
+fn esc_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+fn hostname() -> String {
+    std::fs::read_to_string("/etc/hostname").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "prime".into())
+}
+/// Pull the first `max` http(s) URLs out of free text (for the links section).
+fn first_urls(s: &str, max: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    for tok in s.split(|c: char| c.is_whitespace()) {
+        if tok.starts_with("http://") || tok.starts_with("https://") {
+            let u = tok.trim_end_matches(|c: char| matches!(c, '.' | ',' | ')' | ']' | '"' | '\'')).to_string();
+            if !out.contains(&u) { out.push(u); }
+            if out.len() >= max { break; }
         }
     }
+    out
+}
+
+/// Everything needed to render a polished notification email.
+struct MailParts {
+    accent: String,                 // header bar color, e.g. "#C0392B"
+    kicker: String,                 // small uppercase label
+    title: String,                  // headline
+    intro: String,                  // one-line summary
+    kv: Vec<(String, String)>,      // detail rows (value shown monospace)
+    code: Option<(String, String)>, // (label, monospace block — e.g. resume cmd)
+    steps: Vec<String>,             // "what to do" numbered list
+    links: Vec<(String, String)>,   // (label, url) → buttons
+    footer: String,
+}
+
+fn render_html(m: &MailParts) -> String {
+    let mut kv = String::new();
+    if !m.kv.is_empty() {
+        kv.push_str("<tr><td style=\"padding:4px 28px 8px;\"><table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\">");
+        for (k, v) in &m.kv {
+            kv.push_str(&format!(
+                "<tr><td style=\"padding:5px 0;color:#5b6472;font-size:13px;width:130px;vertical-align:top;\">{}</td><td style=\"padding:5px 0;color:#1a1f2b;font-size:13px;font-family:SFMono-Regular,Consolas,monospace;word-break:break-all;\">{}</td></tr>",
+                esc_html(k), esc_html(v)
+            ));
+        }
+        kv.push_str("</table></td></tr>");
+    }
+    let code = m.code.as_ref().map(|(label, body)| format!(
+        "<tr><td style=\"padding:12px 28px;\"><div style=\"color:#5b6472;font-size:12px;margin-bottom:6px;\">{}</div><div style=\"background:#0f1420;color:#c8d3e6;font-family:SFMono-Regular,Consolas,monospace;font-size:13px;padding:12px 14px;border-radius:8px;white-space:pre-wrap;word-break:break-all;\">{}</div></td></tr>",
+        esc_html(label), esc_html(body)
+    )).unwrap_or_default();
+    let steps = if m.steps.is_empty() { String::new() } else {
+        let items: String = m.steps.iter().enumerate().map(|(i, s)| format!(
+            "<tr><td style=\"padding:4px 8px 4px 0;vertical-align:top;color:{};font-weight:700;font-size:14px;\">{}.</td><td style=\"padding:4px 0;color:#1a1f2b;font-size:14px;line-height:1.5;\">{}</td></tr>",
+            m.accent, i + 1, esc_html(s)
+        )).collect();
+        format!("<tr><td style=\"padding:8px 28px;\"><div style=\"color:#5b6472;font-size:12px;text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px;\">What to do</div><table role=\"presentation\" cellpadding=\"0\" cellspacing=\"0\">{items}</table></td></tr>")
+    };
+    let links = if m.links.is_empty() { String::new() } else {
+        let btns: String = m.links.iter().map(|(label, url)| format!(
+            "<a href=\"{}\" style=\"display:inline-block;margin:6px 8px 6px 0;padding:9px 16px;background:{};color:#ffffff;text-decoration:none;border-radius:8px;font-size:13px;font-weight:600;\">{}</a>",
+            esc_html(url), m.accent, esc_html(label)
+        )).collect();
+        format!("<tr><td style=\"padding:6px 28px 12px;\">{btns}</td></tr>")
+    };
+    format!(
+        "<!doctype html><html><body style=\"margin:0;padding:0;background:#f4f5f7;\">\
+<div style=\"display:none;max-height:0;overflow:hidden;opacity:0;\">{intro}</div>\
+<table role=\"presentation\" width=\"100%\" cellpadding=\"0\" cellspacing=\"0\" style=\"background:#f4f5f7;padding:24px 12px;\"><tr><td align=\"center\">\
+<table role=\"presentation\" width=\"600\" cellpadding=\"0\" cellspacing=\"0\" style=\"width:600px;max-width:600px;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(16,24,40,.1);font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\">\
+<tr><td style=\"background:{accent};padding:20px 28px;\"><div style=\"color:rgba(255,255,255,.82);font-size:11px;letter-spacing:.12em;text-transform:uppercase;font-weight:700;\">{kicker}</div><div style=\"color:#ffffff;font-size:21px;font-weight:700;margin-top:5px;line-height:1.25;\">{title}</div></td></tr>\
+<tr><td style=\"padding:22px 28px 6px;color:#1a1f2b;font-size:15px;line-height:1.55;\">{introhtml}</td></tr>\
+{kv}{code}{steps}{links}\
+<tr><td style=\"padding:16px 28px 24px;border-top:1px solid #eceef2;color:#8a94a6;font-size:12px;line-height:1.5;\">{footer}</td></tr>\
+</table></td></tr></table></body></html>",
+        accent = m.accent, kicker = esc_html(&m.kicker), title = esc_html(&m.title),
+        intro = esc_html(&m.intro), introhtml = esc_html(&m.intro),
+        kv = kv, code = code, steps = steps, links = links, footer = esc_html(&m.footer),
+    )
+}
+
+fn render_text(m: &MailParts) -> String {
+    let mut o = format!("{}\n{}\n\n{}\n", m.kicker, m.title, m.intro);
+    for (k, v) in &m.kv { o.push_str(&format!("  {k}: {v}\n")); }
+    if let Some((label, body)) = &m.code { o.push_str(&format!("\n{label}:\n    {body}\n")); }
+    if !m.steps.is_empty() {
+        o.push_str("\nWhat to do:\n");
+        for (i, s) in m.steps.iter().enumerate() { o.push_str(&format!("  {}. {}\n", i + 1, s)); }
+    }
+    for (label, url) in &m.links { o.push_str(&format!("\n{label}: {url}\n")); }
+    o.push_str(&format!("\n--\n{}\n", m.footer));
+    o
+}
+
+/// Send a multipart/alternative (text + HTML) email via `sendmail -t`.
+fn send_email_rich(to: &str, subject: &str, m: &MailParts) -> bool {
+    use std::process::{Command, Stdio};
+    let boundary = format!("=_cl_{:016x}", fnv1a(&format!("{to}{subject}{}", m.title)));
+    let msg = format!(
+        "To: {to}\r\nFrom: PlausiDen Guard <claude-tools@plausiden.com>\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"{b}\"\r\n\r\n--{b}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{text}\r\n--{b}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: 8bit\r\n\r\n{html}\r\n--{b}--\r\n",
+        to = to, subject = subject, b = boundary, text = render_text(m), html = render_html(m)
+    );
     if let Ok(mut c) = Command::new("sendmail").arg("-t").stdin(Stdio::piped()).spawn() {
         if let Some(si) = c.stdin.as_mut() {
-            let _ = si.write_all(format!("To: {to}\nSubject: {subject}\n\n{body}\n").as_bytes());
+            let _ = si.write_all(msg.as_bytes());
         }
         return c.wait().map(|s| s.success()).unwrap_or(false);
     }
@@ -1553,16 +1640,41 @@ fn cmd_sentinel(
     );
     if cfg.email_enabled && !in_cooldown {
         if let Some(addr) = &cfg.email {
-            emailed = send_email(
-                addr,
-                title,
-                &format!(
-                    "{summary}\n\nMessage:\n{}\n\nResume: claude --resume {}\nBackup dir: {}\n",
-                    hit.message,
-                    hit.session_id,
-                    backup.display()
+            let host = hostname();
+            let kind = if hit.is_policy_block { "cybersecurity-classifier block" } else { "API error" };
+            let mut links: Vec<(String, String)> = first_urls(&hit.message, 2)
+                .into_iter()
+                .map(|u| (if u.contains("cyber-use-case") { "Apply for exemption".to_string() } else { "Learn more".to_string() }, u))
+                .collect();
+            links.push(("Support article".into(), "https://support.claude.com/en/articles/15363606".into()));
+            let parts = MailParts {
+                accent: if hit.is_policy_block { "#B4232B".into() } else { "#B26A00".into() },
+                kicker: "PlausiDen API Guard · Incident".into(),
+                title: if hit.is_policy_block { "A cyber-classifier block halted a session".into() } else { "An API error halted a session".into() },
+                intro: format!(
+                    "{host} detected a {kind} in an interactive session and stopped {} running loop(s). Your conversation is backed up and fully resumable — here's how.",
+                    stopped.len()
                 ),
-            );
+                kv: vec![
+                    ("Host".into(), host.clone()),
+                    ("Error code".into(), hit.error_code.clone()),
+                    ("Session".into(), hit.session_id.clone()),
+                    ("Loops stopped".into(), if stopped.is_empty() { "none (not a guarded loop)".into() } else { stopped.join(", ") }),
+                    ("Message".into(), hit.message.chars().take(240).collect::<String>()),
+                ],
+                code: Some(("Resume the full conversation".into(), format!("claude --resume {}", hit.session_id))),
+                steps: vec![
+                    "Run the command above to re-attach to the session — the entire conversation returns.".into(),
+                    format!("If that session is gone, the complete raw transcript is preserved at {}/transcript.jsonl — open it or hand it to a fresh session.", backup.display()),
+                    "Fix the underlying cause, then re-arm any halted loop with:  claude-loop guard --label <LABEL> --reset".into(),
+                ],
+                links,
+                footer: format!(
+                    "Sent by the claude-loop sentinel on {host} at {}.  Disable: systemctl disable --now claude-sentinel.timer  ·  Reconfigure: claude-loop sentinel --setup",
+                    Utc::now().to_rfc3339()
+                ),
+            };
+            emailed = send_email_rich(addr, "PlausiDen API Guard — session halted, backup ready", &parts);
             if emailed {
                 let _ = fs::write(&cooldown_path, Utc::now().to_rfc3339());
                 chmod_600(&cooldown_path).ok();
