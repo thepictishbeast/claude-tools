@@ -7,6 +7,8 @@
 TOOLS="${CLAUDE_TOOLS_DIR:-$HOME/Development/claude-tools}"
 META="${PLAUSIDEN_META_DIR:-$HOME/PlausiDen-Meta}"
 LOG=""
+# install.sh needs cargo; rustup installs it outside non-interactive PATH
+PATH="$HOME/.cargo/bin:$PATH"; export PATH
 
 refresh() {
   d="$1"; name="$2"
