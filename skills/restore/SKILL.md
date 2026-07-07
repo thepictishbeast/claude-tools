@@ -22,12 +22,18 @@ session uses the latest skills. Look for a cloned `claude-tools`
 repo at these paths in order:
 
 ```
+$HOME/Development/claude-tools
 $HOME/claude-tools
 $HOME/projects/claude-tools
 $HOME/git/claude-tools
 $HOME/code/claude-tools
 /tmp/claude-tools
 ```
+
+If the first hit is under `/tmp`, treat it as WRONG-HOME: /tmp is
+noexec + volatile on hardened hosts (`./update.sh` fails with
+"permission denied" despite correct exec bits — run via `sh` and
+re-clone to `~/Development/claude-tools`).
 
 For the first hit (verify with `git remote get-url origin | grep
 claude-tools`), if the working tree is clean:

@@ -47,6 +47,29 @@ You should run `/loop-update` at the start of any work session that
 touches Claude tooling. The repo evolves; stale clones produce
 divergent agents.
 
+### 2b. Session auto-refresh (added 2026-07-07)
+
+Every Claude session should start current without manual syncs.
+`lib/session-refresh.sh` pulls this repo **and** `PlausiDen-Meta`
+(≤15s timeout each, never blocks), re-runs `install.sh` when
+claude-tools changed, and emits a one-line status. Wire it as a
+SessionStart hook in `~/.claude/settings.json`:
+
+```json
+"hooks": { "SessionStart": [ { "hooks": [ {
+  "type": "command",
+  "command": "sh $HOME/Development/claude-tools/lib/session-refresh.sh",
+  "timeout": 45, "statusMessage": "Refreshing claude-tools + Meta"
+} ] } ] }
+```
+
+Notes: hook stdout lands in the session's context — when it says
+`updated`, re-read META.md (this file) / PlausiDen-Meta before
+relying on stale conventions. NEW skills still only load at the
+NEXT session start. Clone location is canonical
+`~/Development/claude-tools` (NOT `/tmp` — noexec + volatile);
+`~/claude-tools` may be a symlink to it for older path lists.
+
 ---
 
 ## 3. What's installed (snapshot 2026-05-20)
