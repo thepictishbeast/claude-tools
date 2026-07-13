@@ -1,0 +1,22 @@
+# site-gate registry - every outward-facing site gets checked on the timer.
+# level = "full"   -> run the repo's own gate (tests + build + browser audit)
+# level = "health" -> HTTP 200 + security headers + TLS expiry (no repo needed)
+# Add a [[site]] block per site; site-gate.sh parses this line-wise (keep the
+# key = "value" shape).
+
+[[site]]
+name = "mom-site"
+url = "https://dev.plausiden.com/"
+level = "full"
+repo = "/home/paul/projects/mom-site"
+cmd = "./check.sh"
+
+[[site]]
+name = "plausiden"
+url = "https://plausiden.com/"
+level = "health"
+
+[[site]]
+name = "sacredvote"
+url = "https://sacredvote.org/"
+level = "health"
