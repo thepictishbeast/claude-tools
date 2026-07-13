@@ -10,6 +10,13 @@ work on every fire, you drop whatever you were mid-doing, you
 duplicate effort across iterations, and the loop log fills with
 half-finished threads.
 
+## Binding policy
+
+[`docs/LOOP_POLICY.md`](./docs/LOOP_POLICY.md) is binding for every loop:
+never stop by accident (arm or announce), no wasted polling intervals
+(notifications primary, long fallbacks only), ROI ladder every tick, idle
+heartbeat instead of stopping when owner-blocked, atomic durable ticks.
+
 ## The single rule
 
 > **A loop fire is a SIGNAL to continue, not a command to start
