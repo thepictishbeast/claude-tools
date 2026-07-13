@@ -33,10 +33,12 @@ failed=$(systemctl --failed --no-legend --plain 2>/dev/null | awk '{print $1}')
 $failed")
 
 # 4. disk
-for m in / /tank; do
-  use=$(df --output=pcent "$m" 2>/dev/null | tail -1 | tr -dc '0-9')
-  [[ -n "$use" ]] && (( use >= 90 )) && issues+=("$m at ${use}% disk usage")
-done
+# every real mounted filesystem (found the hard way: /home filled while
+# only / and /tank were watched, 2026-07-13)
+while read -r mount use; do
+  use=${use%\%}
+  (( use >= 90 )) && issues+=("$mount at ${use}% disk usage")
+done < <(df --output=target,pcent -x tmpfs -x devtmpfs -x overlay 2>/dev/null | tail -n +2)
 
 if ((${#issues[@]})); then
   {
