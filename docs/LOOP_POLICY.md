@@ -84,3 +84,21 @@ re-arms. Crash-recovery reads state from disk, never from chat memory.
   work partial).
 - Treating each identical cron prompt as a fresh directive instead of a
   continuation signal (see CLAUDE.md "single rule").
+
+## Amendment 2026-07-14 (owner directive, overrides Rule sections above)
+
+Paul: "why isnt your loop interval 1m ... it needs to infinitely do good
+work" + "what part of dont stop do you not understand".
+
+1. **Interval is 1 minute, owner-set.** Not a judgment call. Idle-heartbeat
+   stretching (20-60 min) is retired; an idle tick self-checks cheaply and
+   ends. The usage-guard breaker is the ONLY thing that may pause firing,
+   and it lifts itself at quota reset.
+2. **Never stop arming.** `feedback_loop_idle_when_no_signal` (stop after 3
+   idle ticks) is superseded for paul's improvement loops. Blocked-on-paul
+   is not idle: re-verify state, advance the next unblocked ladder item,
+   however small.
+3. **Owner decisions default to CEO mode.** If a decision is reversible,
+   make the call, execute, and report it with the revert path - don't park
+   work as "awaiting paul" (the CMS access route sat parked for a day;
+   the executable answer took 20 minutes).
