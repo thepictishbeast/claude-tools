@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Deborah editing session launcher (mom-site docs/DEBORAH_CHANNEL.md option A).
+# Starts claude in the mom-site repo preloaded with the Deborah context pack.
+# Runs as paul (drops from root if needed). Install: /usr/local/bin/deborah
+set -euo pipefail
+
+SITE=/home/paul/projects/mom-site
+PACK="$SITE/docs/DEBORAH_SESSION_CONTEXT.md"
+
+[[ -f $PACK ]] || { echo "context pack missing: $PACK" >&2; exit 1; }
+
+if [[ ${1:-} == --dry-run ]]; then
+    echo "would run: (cd $SITE && claude --append-system-prompt <$PACK)"
+    exit 0
+fi
+
+if [[ $EUID -eq 0 ]]; then
+    exec sudo -u paul -- bash -c 'cd "$1" && exec claude --append-system-prompt "$(cat "$2")"' -- "$SITE" "$PACK"
+fi
+cd "$SITE" && exec claude --append-system-prompt "$(cat "$PACK")"
