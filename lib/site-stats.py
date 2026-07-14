@@ -19,6 +19,7 @@ import json
 import re
 import subprocess
 import sys
+import urllib.parse
 from collections import Counter, defaultdict
 
 BOT_RE = re.compile(
@@ -42,6 +43,10 @@ def digest(paths, hours):
     sites = defaultdict(lambda: {
         "pageviews": 0, "requests": 0, "ips": set(), "pages": Counter(),
         "referrers": Counter(), "status": Counter(), "bots": 0,
+        # Consent-gated beacon pings (GET /t): aggregated by their labeled
+        # dimensions, kept OUT of the pageview numbers above.
+        "pings": 0, "ping_pages": Counter(), "ping_vw": Counter(),
+        "ping_theme": Counter(), "ping_refs": Counter(),
     })
     for path in paths:
         try:
@@ -73,7 +78,21 @@ def digest(paths, hours):
                 if BOT_RE.search(ua):
                     s["bots"] += 1
                     continue
-                uri = req.get("uri", "/").split("?")[0]
+                full_uri = req.get("uri", "/")
+                uri = full_uri.split("?")[0]
+                if uri == "/t":
+                    # Opt-in usage ping (mom-site beacon.js, consent-gated).
+                    # Count its labeled dimensions only; never a pageview,
+                    # never tied to an IP.
+                    if 200 <= status < 300:
+                        q = urllib.parse.parse_qs(urllib.parse.urlparse(full_uri).query)
+                        s["pings"] += 1
+                        for param, counter in (("p", "ping_pages"), ("vw", "ping_vw"),
+                                               ("th", "ping_theme"), ("r", "ping_refs")):
+                            v = q.get(param, [""])[0]
+                            if v:
+                                s[counter][v[:80]] += 1
+                    continue
                 if ASSET_RE.search(uri):
                     continue
                 if 200 <= status < 300:
@@ -105,6 +124,15 @@ def render(sites, hours):
         ]
         if s["referrers"]:
             lines += ["  top referrers:", *[f"    {n:>5}  {r}" for r, n in s["referrers"].most_common(5)]]
+        if s["pings"]:
+            vw = "  ".join(f"{k}:{v}" for k, v in s["ping_vw"].most_common())
+            th = "  ".join(f"{k}:{v}" for k, v in s["ping_theme"].most_common())
+            lines += [
+                f"  opt-in pings (consent-gated beacon): {s['pings']}   viewports: {vw}   themes: {th}",
+                *[f"    {n:>5}  {p}" for p, n in s["ping_pages"].most_common(5)],
+            ]
+            if s["ping_refs"]:
+                lines += ["    ping referrer domains:", *[f"    {n:>5}  {r}" for r, n in s["ping_refs"].most_common(3)]]
         lines.append("")
     return "\n".join(lines)
 
