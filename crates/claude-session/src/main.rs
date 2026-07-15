@@ -1,20 +1,26 @@
-//! claude-session — track (and later isolate) Claude Code sessions so that two
-//! sessions running in the same working directory stop clashing.
+//! claude-session — track and isolate Claude Code sessions so that two sessions
+//! running in the same working directory stop clashing (corrupted git index,
+//! stomped commits, restore picking the wrong session).
 //!
-//! Stage 1 (this file): a per-session registry + collision detection. Each
-//! session writes its own small JSON record (no shared file → no lock
-//! contention, which would be the very clash we're fixing). `list` reads them
-//! all and flags any repo whose *live* working tree is claimed by more than one
-//! active session — the situation that corrupts indexes and stomps commits.
+//! Two layers:
+//!   * **Registry** — each session writes its own small JSON record
+//!     (~/.claude/sessions/<sid>.json). Per-session files, not one shared file,
+//!     so the registry itself is never the thing two sessions fight over.
+//!     `list`/`guard` read them and flag any repo whose *live* tree is claimed
+//!     by 2+ active sessions.
+//!   * **Isolation** — `isolate` puts THIS session in its own git worktree
+//!     (separate index + files, shared history, a per-session branch), so work
+//!     can't collide. `release` tears it down.
 //!
-//! Stage 2 will add `isolate`/`release`/`guard` (git-worktree isolation).
+//! Complementary to the Agent OS SESSION-PROTOCOL (that governs bootstrap +
+//! project/goal registry); this governs the session *process* + working tree.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
@@ -30,12 +36,36 @@ struct Cli {
 enum Cmd {
     /// Record (or refresh) THIS session in the registry.
     Register {
-        /// Override the session id (else $CLAUDE_CODE_SESSION_ID, else newest transcript).
+        /// Override session id (else $CLAUDE_CODE_SESSION_ID, else newest transcript).
         #[arg(long)]
         session_id: Option<String>,
     },
     /// List known sessions and flag collisions (2+ active sessions sharing a live tree).
     List,
+    /// Put THIS session in its own git worktree, isolated from the shared live tree.
+    Isolate {
+        /// Repo to isolate (default: the git repo at cwd).
+        #[arg(long)]
+        repo: Option<PathBuf>,
+        /// Base ref for the session branch (default: HEAD).
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        session_id: Option<String>,
+    },
+    /// Remove this session's worktree and clear it from the registry.
+    Release {
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Keep the per-session branch instead of deleting it.
+        #[arg(long)]
+        keep_branch: bool,
+    },
+    /// Advisory: exit 3 if another active session shares this repo's live tree.
+    Guard {
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,12 +77,14 @@ struct Record {
     #[serde(default)]
     worktree: Option<String>,
     #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
     transcript: Option<String>,
     started_at: String,
     last_seen: String,
 }
 
-const ACTIVE_SECS: u64 = 600; // a session is "active" if its transcript/record changed within 10 min
+const ACTIVE_SECS: u64 = 600; // "active" if transcript/record changed within 10 min
 
 fn home() -> PathBuf {
     env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/root"))
@@ -66,19 +98,19 @@ fn reg_path(sid: &str) -> PathBuf {
 fn projects_dir() -> PathBuf {
     home().join(".claude/projects")
 }
+fn worktrees_root() -> PathBuf {
+    home().join(".claude/worktrees")
+}
 fn short(sid: &str) -> &str {
     &sid[..sid.len().min(8)]
 }
 
-/// Session ids are UUID-shaped. Restrict to that charset so a value coming from
-/// the environment can never contain `/` or `..` and steer the registry path.
+/// Session ids are UUID-shaped. Restrict to that charset so a value from the
+/// environment can never contain `/` or `..` and steer the registry path.
 fn valid_sid(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 100
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    !s.is_empty() && s.len() <= 100 && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-/// Newest `<sid>.jsonl` under ~/.claude/projects/*/ — the currently-liveliest session.
 fn newest_transcript() -> Option<(String, PathBuf)> {
     let mut best: Option<(std::time::SystemTime, String, PathBuf)> = None;
     for d in fs::read_dir(projects_dir()).into_iter().flatten().flatten() {
@@ -115,21 +147,19 @@ fn resolve_sid(explicit: Option<String>) -> Option<String> {
     explicit
         .or_else(|| env::var("CLAUDE_CODE_SESSION_ID").ok().filter(|s| !s.is_empty()))
         .or_else(|| newest_transcript().map(|(sid, _)| sid))
-        .filter(|s| valid_sid(s)) // reject anything that isn't UUID-shaped
+        .filter(|s| valid_sid(s))
+}
+
+fn run_git(args: &[&str], cwd: &Path) -> Result<String> {
+    let out = Command::new("git").arg("-C").arg(cwd).args(args).output()?;
+    if !out.status.success() {
+        bail!("git {:?} failed: {}", args, String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 fn git_toplevel(pwd: &Path) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(pwd)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
+    run_git(&["rev-parse", "--show-toplevel"], pwd).ok().filter(|s| !s.is_empty())
 }
 
 fn fresh(path: &str) -> bool {
@@ -140,46 +170,58 @@ fn fresh(path: &str) -> bool {
         .is_some_and(|e| e.as_secs() < ACTIVE_SECS)
 }
 
-/// Active if the transcript grew recently (Claude appends every turn) or the
-/// record itself was refreshed recently.
 fn is_active(rec: &Record) -> bool {
-    rec.transcript.as_deref().is_some_and(fresh)
-        || fresh(&reg_path(&rec.session_id).to_string_lossy())
+    rec.transcript.as_deref().is_some_and(fresh) || fresh(&reg_path(&rec.session_id).to_string_lossy())
+}
+
+fn load_one(sid: &str) -> Option<Record> {
+    fs::read_to_string(reg_path(sid)).ok().and_then(|s| serde_json::from_str(&s).ok())
 }
 
 fn load_all() -> Vec<Record> {
     let mut v = vec![];
     for f in fs::read_dir(reg_dir()).into_iter().flatten().flatten() {
         if f.path().extension().and_then(|e| e.to_str()) == Some("json") {
-            if let Some(r) = fs::read_to_string(f.path())
-                .ok()
-                .and_then(|s| serde_json::from_str::<Record>(&s).ok())
-            {
-                v.push(r);
+            if let Some(r) = fs::read_to_string(f.path()).ok().and_then(|s| serde_json::from_str::<Record>(&s).ok()) {
+                if valid_sid(&r.session_id) {
+                    v.push(r);
+                }
             }
         }
     }
     v
 }
 
+fn save(rec: &Record) -> Result<()> {
+    fs::create_dir_all(reg_dir())?;
+    fs::write(reg_path(&rec.session_id), serde_json::to_string_pretty(rec)?)?;
+    Ok(())
+}
+
+fn record_for(sid: &str) -> Record {
+    load_one(sid).unwrap_or_else(|| Record {
+        session_id: sid.to_string(),
+        pwd: env::current_dir().map(|p| p.to_string_lossy().to_string()).unwrap_or_default(),
+        repo_root: None,
+        worktree: None,
+        branch: None,
+        transcript: transcript_for(sid).map(|p| p.to_string_lossy().to_string()),
+        started_at: Utc::now().to_rfc3339(),
+        last_seen: Utc::now().to_rfc3339(),
+    })
+}
+
 fn cmd_register(session_id: Option<String>) -> Result<()> {
     let sid = resolve_sid(session_id)
         .context("could not resolve session id (set $CLAUDE_CODE_SESSION_ID or pass --session-id)")?;
     let pwd = env::current_dir()?.to_string_lossy().to_string();
-    let repo_root = git_toplevel(Path::new(&pwd));
-    let transcript = transcript_for(&sid).map(|p| p.to_string_lossy().to_string());
-    fs::create_dir_all(reg_dir())?;
-    let path = reg_path(&sid);
-    let now = Utc::now().to_rfc3339();
-    // preserve started_at + any worktree already recorded for this session
-    let (started_at, worktree) = fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Record>(&s).ok())
-        .map(|p| (p.started_at, p.worktree))
-        .unwrap_or_else(|| (now.clone(), None));
-    let rec = Record { session_id: sid.clone(), pwd, repo_root, worktree, transcript, started_at, last_seen: now };
-    fs::write(&path, serde_json::to_string_pretty(&rec)?)?;
-    println!("registered session {} -> {}", short(&sid), path.display());
+    let mut rec = record_for(&sid);
+    rec.pwd = pwd.clone();
+    rec.repo_root = git_toplevel(Path::new(&pwd));
+    rec.transcript = transcript_for(&sid).map(|p| p.to_string_lossy().to_string());
+    rec.last_seen = Utc::now().to_rfc3339();
+    save(&rec)?;
+    println!("registered session {} -> {}", short(&sid), reg_path(&sid).display());
     Ok(())
 }
 
@@ -189,7 +231,6 @@ fn cmd_list() -> Result<()> {
         println!("no sessions registered (run: claude-session register)");
         return Ok(());
     }
-    // repo_root -> active sessions working in its LIVE tree (no worktree)
     let mut live: HashMap<String, Vec<String>> = HashMap::new();
     println!("{:<10} {:<7} {:<9} repo / pwd", "session", "active", "tree");
     for r in &recs {
@@ -213,7 +254,7 @@ fn cmd_list() -> Result<()> {
         if sids.len() > 1 {
             collision = true;
             println!("\n⚠ COLLISION: {} active sessions share the LIVE tree of {} — {:?}", sids.len(), repo, sids);
-            println!("  -> isolate one (stage 2): claude-session isolate   # run inside that session");
+            println!("  -> isolate one: claude-session isolate   # run inside that session");
         }
     }
     if !collision {
@@ -222,9 +263,111 @@ fn cmd_list() -> Result<()> {
     Ok(())
 }
 
+fn cmd_isolate(repo: Option<PathBuf>, base: Option<String>, session_id: Option<String>) -> Result<()> {
+    let sid = resolve_sid(session_id).context("could not resolve session id")?;
+    let sid8 = short(&sid).to_string();
+    let cwd = env::current_dir()?;
+    let repo_root = match repo {
+        Some(r) => r,
+        None => PathBuf::from(git_toplevel(&cwd).context("not inside a git repo (pass --repo)")?),
+    };
+
+    // Already isolated (and the worktree still exists)? Idempotent.
+    if let Some(rec) = load_one(&sid) {
+        if let Some(wt) = rec.worktree.as_deref() {
+            if Path::new(wt).is_dir() {
+                println!("already isolated: {wt}");
+                return Ok(());
+            }
+        }
+    }
+
+    let name = repo_root.file_name().and_then(|s| s.to_str()).unwrap_or("repo");
+    let dest = worktrees_root().join(name).join(&sid8);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let dest_s = dest.to_string_lossy().to_string();
+    let branch = format!("session/{sid8}");
+    let base_ref = base.unwrap_or_else(|| "HEAD".to_string());
+
+    let branch_ref = format!("refs/heads/{branch}");
+    let branch_exists = run_git(&["rev-parse", "--verify", branch_ref.as_str()], &repo_root).is_ok();
+    if branch_exists {
+        run_git(&["worktree", "add", dest_s.as_str(), branch.as_str()], &repo_root)?;
+    } else {
+        run_git(&["worktree", "add", "-b", branch.as_str(), dest_s.as_str(), base_ref.as_str()], &repo_root)?;
+    }
+
+    let mut rec = record_for(&sid);
+    rec.repo_root = Some(repo_root.to_string_lossy().to_string());
+    rec.worktree = Some(dest_s.clone());
+    rec.branch = Some(branch.clone());
+    rec.last_seen = Utc::now().to_rfc3339();
+    save(&rec)?;
+
+    println!("isolated session {sid8}");
+    println!("  worktree: {dest_s}");
+    println!("  branch:   {branch}");
+    println!("  -> cd {dest_s}   (work there; merge the branch back later)");
+    println!("  -> release with: claude-session release");
+    Ok(())
+}
+
+fn cmd_release(session_id: Option<String>, keep_branch: bool) -> Result<()> {
+    let sid = resolve_sid(session_id).context("could not resolve session id")?;
+    let rec = load_one(&sid).context("no registry record for this session")?;
+    let wt = rec.worktree.clone().context("this session has no worktree recorded")?;
+    let repo_root = rec.repo_root.clone().context("no repo_root recorded")?;
+    let repo_path = PathBuf::from(&repo_root);
+
+    // `git worktree remove` refuses if the worktree is dirty — surface that as a
+    // helpful hint rather than silently discarding work.
+    run_git(&["worktree", "remove", wt.as_str()], &repo_path).map_err(|e| {
+        anyhow::anyhow!("{e}\n  the worktree has uncommitted changes — commit/stash in {wt} first, or `git worktree remove --force` by hand if you're sure")
+    })?;
+
+    if !keep_branch {
+        if let Some(branch) = &rec.branch {
+            let _ = run_git(&["branch", "-D", branch.as_str()], &repo_path); // best-effort
+        }
+    }
+
+    let mut rec = rec;
+    rec.worktree = None;
+    rec.branch = None;
+    rec.last_seen = Utc::now().to_rfc3339();
+    save(&rec)?;
+    println!("released worktree for {} ({wt})", short(&sid));
+    Ok(())
+}
+
+fn cmd_guard(repo: Option<PathBuf>) -> Result<()> {
+    let cwd = env::current_dir()?;
+    let target = match repo {
+        Some(r) => r.to_string_lossy().to_string(),
+        None => git_toplevel(&cwd).unwrap_or_else(|| cwd.to_string_lossy().to_string()),
+    };
+    let others: Vec<String> = load_all()
+        .into_iter()
+        .filter(|r| is_active(r) && r.worktree.is_none() && r.repo_root.as_deref() == Some(target.as_str()))
+        .map(|r| short(&r.session_id).to_string())
+        .collect();
+    if others.len() > 1 {
+        eprintln!("⚠ {} active sessions share the live tree of {} — {:?}", others.len(), target, others);
+        eprintln!("  isolate this one: claude-session isolate");
+        std::process::exit(3);
+    }
+    println!("ok: no live-tree collision for {target}");
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Register { session_id } => cmd_register(session_id),
         Cmd::List => cmd_list(),
+        Cmd::Isolate { repo, base, session_id } => cmd_isolate(repo, base, session_id),
+        Cmd::Release { session_id, keep_branch } => cmd_release(session_id, keep_branch),
+        Cmd::Guard { repo } => cmd_guard(repo),
     }
 }
