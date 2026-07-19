@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{env, fs};
 
@@ -65,6 +65,9 @@ enum Cmd {
         r#ref: Option<String>,
         #[arg(long)]
         repo: Option<String>,
+        /// Room to post into (default "main").
+        #[arg(long)]
+        room: Option<String>,
         /// Write only to the local bus; do not commit/push.
         #[arg(long)]
         local: bool,
@@ -74,6 +77,18 @@ enum Cmd {
         #[arg(long)]
         count: bool,
     },
+    /// Refresh this node's presence heartbeat.
+    Beat,
+    /// List who is currently present (fresh heartbeat) vs idle/left.
+    Presence,
+    /// Mark this node as having left the mesh.
+    Leave,
+    /// Join a room (start seeing its messages).
+    Join {
+        room: String,
+    },
+    /// List rooms seen in the bus and which I've joined.
+    Rooms,
     /// Print one message (id or id-prefix) and mark it seen.
     Read {
         id: String,
@@ -103,11 +118,22 @@ struct Config {
     /// runs as root but the repo is owned by someone else (root agent, paul repo).
     #[serde(default)]
     git_user: Option<String>,
+    /// Rooms this node participates in (default ["main"]). inbox/nudge only
+    /// surface messages in these rooms.
+    #[serde(default = "default_rooms")]
+    rooms: Vec<String>,
 }
 
 fn empty_obj() -> serde_json::Value {
     serde_json::json!({})
 }
+fn default_room() -> String {
+    "main".into()
+}
+fn default_rooms() -> Vec<String> {
+    vec!["main".into()]
+}
+const PRESENCE_TTL_SECS: i64 = 900; // a node idle >15min drops off the present roster
 
 #[derive(Serialize, Deserialize, Clone)]
 struct Message {
@@ -124,6 +150,8 @@ struct Message {
     body: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     repo: Option<String>,
+    #[serde(default = "default_room")]
+    room: String,
     #[serde(default = "empty_obj")]
     ext: serde_json::Value,
     #[serde(default)]
@@ -326,7 +354,7 @@ fn unread(cfg: &Config) -> Vec<Message> {
     let seen = load_seen();
     all_messages(cfg)
         .into_iter()
-        .filter(|m| m.from != cfg.id && addressed_to_me(m, cfg) && !seen.contains(&m.id))
+        .filter(|m| m.from != cfg.id && cfg.rooms.contains(&m.room) && addressed_to_me(m, cfg) && !seen.contains(&m.id))
         .collect()
 }
 
@@ -337,7 +365,7 @@ fn cmd_init(role: String, host: Option<String>, repo: Option<PathBuf>, sid: Opti
     let repo = repo.unwrap_or_else(|| PathBuf::from("/home/paul/projects/agent-mesh"));
     let sid8 = derive_sid8(sid);
     let id = format!("{role}@{host}#{sid8}"); // enforced: never bare
-    let cfg = Config { id: id.clone(), role, host, sid8: Some(sid8), repo: repo.to_string_lossy().to_string(), git_user };
+    let cfg = Config { id: id.clone(), role, host, sid8: Some(sid8), repo: repo.to_string_lossy().to_string(), git_user, rooms: default_rooms() };
     fs::create_dir_all(session_dir())?;
     fs::create_dir_all(local_bus())?;
     fs::write(config_path(), serde_json::to_string_pretty(&cfg)? + "\n")?;
@@ -369,7 +397,7 @@ fn commit(cfg: &Config, msg: &str) -> Result<String> {
     git(cfg, &["-c", &format!("user.name={}", cfg.id), "-c", "user.email=mesh@plausiden.com", "commit", "-q", "-m", msg])
 }
 
-fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>, repo_ctx: Option<String>, local: bool) -> Result<()> {
+fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>, repo_ctx: Option<String>, room: Option<String>, local: bool) -> Result<()> {
     let cfg = load_config()?;
     let mut body = String::new();
     let _ = std::io::stdin().read_to_string(&mut body);
@@ -385,6 +413,7 @@ fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>
         subject,
         body: body.trim_end().to_string(),
         repo: repo_ctx,
+        room: room.unwrap_or_else(default_room),
         ext: empty_obj(),
         sig: None,
     };
@@ -407,6 +436,7 @@ fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>
     } else {
         println!("posted {} -> {} (local only)", &id[..8], m.to);
     }
+    heartbeat(&cfg); // any activity refreshes presence (throttled inside)
     Ok(())
 }
 
@@ -480,6 +510,7 @@ fn cmd_nudge() -> Result<()> {
         Err(_) => return Ok(()),
     };
     let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
+    heartbeat(&cfg); // every prompt (via coord.sh) refreshes presence; idle sessions expire
     let msgs = unread(&cfg);
     if msgs.is_empty() {
         return Ok(());
@@ -492,17 +523,134 @@ fn cmd_nudge() -> Result<()> {
     Ok(())
 }
 
+#[derive(Serialize, Deserialize)]
+struct Status {
+    id: String,
+    role: String,
+    host: String,
+    #[serde(default)]
+    rooms: Vec<String>,
+    last_seen: String,
+    #[serde(default)]
+    status: String,
+}
+
+fn status_path(cfg: &Config) -> PathBuf {
+    PathBuf::from(&cfg.repo).join("nodes").join(format!("{}.status", sanitize(&cfg.id)))
+}
+fn secs_since_mtime(p: &Path) -> Option<u64> {
+    fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).map(|e| e.as_secs())
+}
+fn write_status(cfg: &Config, state: &str) -> Result<()> {
+    fs::create_dir_all(PathBuf::from(&cfg.repo).join("nodes"))?;
+    let st = Status {
+        id: cfg.id.clone(),
+        role: cfg.role.clone(),
+        host: cfg.host.clone(),
+        rooms: cfg.rooms.clone(),
+        last_seen: now_rfc3339(),
+        status: state.into(),
+    };
+    fs::write(status_path(cfg), serde_json::to_string_pretty(&st)? + "\n")?;
+    let rel = format!("nodes/{}.status", sanitize(&cfg.id));
+    let _ = git(cfg, &["add", &rel]);
+    let _ = commit(cfg, &format!("beat {} ({state})", cfg.id));
+    let _ = git_ok(cfg, &["pull", "--rebase", "--autostash"]);
+    let _ = git_ok(cfg, &["push"]);
+    Ok(())
+}
+/// Refresh presence, throttled so activity doesn't churn git more than ~1/5min.
+fn heartbeat(cfg: &Config) {
+    if secs_since_mtime(&status_path(cfg)).is_some_and(|s| s < 300) {
+        return;
+    }
+    let _ = write_status(cfg, "online");
+}
+fn cmd_beat() -> Result<()> {
+    let cfg = load_config()?;
+    write_status(&cfg, "online")?;
+    println!("beat {} (rooms: {})", cfg.id, cfg.rooms.join(","));
+    Ok(())
+}
+fn cmd_leave() -> Result<()> {
+    let cfg = load_config()?;
+    write_status(&cfg, "left")?;
+    println!("left the mesh: {}", cfg.id);
+    Ok(())
+}
+fn cmd_presence() -> Result<()> {
+    let cfg = load_config()?;
+    let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
+    let now = Utc::now();
+    let (mut present, mut away) = (Vec::new(), Vec::new());
+    for f in fs::read_dir(PathBuf::from(&cfg.repo).join("nodes")).into_iter().flatten().flatten() {
+        let p = f.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("status") {
+            continue;
+        }
+        if let Some(st) = fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str::<Status>(&s).ok()) {
+            let age = chrono::DateTime::parse_from_rfc3339(&st.last_seen)
+                .map(|t| (now - t.with_timezone(&Utc)).num_seconds())
+                .unwrap_or(i64::MAX);
+            let line = format!("{:<30} rooms=[{}] seen {}s ago", st.id, st.rooms.join(","), age.max(0));
+            if st.status != "left" && age < PRESENCE_TTL_SECS {
+                present.push(line);
+            } else {
+                away.push(format!("{line}{}", if st.status == "left" { " (left)" } else { " (idle)" }));
+            }
+        }
+    }
+    present.sort();
+    away.sort();
+    println!("PRESENT ({}):", present.len());
+    for l in &present {
+        println!("  🟢 {l}");
+    }
+    if !away.is_empty() {
+        println!("away/left ({}):", away.len());
+        for l in &away {
+            println!("  ⚪ {l}");
+        }
+    }
+    Ok(())
+}
+fn cmd_join(room: String) -> Result<()> {
+    let mut cfg = load_config()?;
+    if !cfg.rooms.contains(&room) {
+        cfg.rooms.push(room.clone());
+        fs::write(config_path(), serde_json::to_string_pretty(&cfg)? + "\n")?;
+    }
+    println!("joined '{room}' — now in: {}", cfg.rooms.join(","));
+    Ok(())
+}
+fn cmd_rooms() -> Result<()> {
+    let cfg = load_config()?;
+    let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
+    let mut set: std::collections::BTreeSet<String> = all_messages(&cfg).into_iter().map(|m| m.room).collect();
+    set.insert("main".into());
+    println!("rooms (★ joined):");
+    for r in set {
+        println!("  {} {r}", if cfg.rooms.contains(&r) { "★" } else { " " });
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     match Cli::parse().cmd {
         Cmd::Init { role, host, repo, sid, git_user } => cmd_init(role, host, repo, sid, git_user),
         Cmd::Whoami => cmd_whoami(),
         Cmd::Register { note } => cmd_register(note),
-        Cmd::Post { to, kind, subject, r#ref, repo, local } => cmd_post(to, kind, subject, r#ref, repo, local),
+        Cmd::Post { to, kind, subject, r#ref, repo, room, local } => cmd_post(to, kind, subject, r#ref, repo, room, local),
         Cmd::Inbox { count } => cmd_inbox(count),
         Cmd::Read { id } => cmd_read(id),
         Cmd::Ack { id, all } => cmd_ack(id, all),
         Cmd::Sync => cmd_sync(),
         Cmd::Nudge => cmd_nudge(),
+        Cmd::Beat => cmd_beat(),
+        Cmd::Presence => cmd_presence(),
+        Cmd::Leave => cmd_leave(),
+        Cmd::Join { room } => cmd_join(room),
+        Cmd::Rooms => cmd_rooms(),
     }
 }
 
