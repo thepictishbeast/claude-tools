@@ -21,6 +21,8 @@ use clap::{Parser, Subcommand};
 use serde::{Deserialize, Serialize};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
+mod monitor;
+
 #[derive(Parser)]
 #[command(name = "claude-mesh", version, about = "Message other Claude sessions over agent-mesh")]
 struct Cli {
@@ -121,6 +123,15 @@ enum Cmd {
     Sync,
     /// One-line "N new messages" for session hooks (silent if none).
     Nudge,
+    /// Live full-screen monitor: watch the conversation and type replies inline.
+    Monitor {
+        /// Room to watch (default: your joined rooms, or `main`).
+        #[arg(long)]
+        room: Option<String>,
+        /// Start with full message bodies shown (toggle live with Ctrl-F).
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -502,7 +513,8 @@ fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>
     let mut body = String::new();
     let _ = std::io::stdin().read_to_string(&mut body);
     let id = rand_hex(8);
-    let mut m = Message {
+    let to_disp = to.clone();
+    let m = Message {
         v: 1,
         id: id.clone(),
         from: cfg.id.clone(),
@@ -517,31 +529,63 @@ fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>
         ext: empty_obj(),
         sig: None,
     };
-    // Sign the message (Ed25519) so recipients can verify it's really from us.
-    if let Ok(sk) = ensure_signing_key() {
-        m.sig = Some(hex::encode(sk.sign(&signable_bytes(&m)).to_bytes()));
-    }
-    let fname = format!("{}-{}-{}.json", now_stamp(), sanitize(&cfg.id), &id[..8]);
-    let json = serde_json::to_string_pretty(&m)? + "\n";
-    // fast local copy (same-host readers see it without a pull)
-    fs::create_dir_all(local_bus())?;
-    fs::write(local_bus().join(&fname), &json)?;
-    // durable copy in the shared repo
-    let repo_bus = PathBuf::from(&cfg.repo).join("bus");
-    fs::create_dir_all(&repo_bus)?;
-    fs::write(repo_bus.join(&fname), &json)?;
-    if !local {
-        let rel = format!("bus/{fname}");
-        git(&cfg, &["add", &rel])?;
-        commit(&cfg, &format!("msg: {}", m.subject))?;
-        let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
-        let pushed = git_ok(&cfg, &["push"]);
-        println!("posted {} -> {} ({})", &id[..8], m.to, if pushed { "pushed" } else { "local commit — run: claude-mesh sync" });
+    let pushed = write_and_push(&cfg, m, local)?;
+    if local {
+        println!("posted {} -> {} (local only)", &id[..8], to_disp);
     } else {
-        println!("posted {} -> {} (local only)", &id[..8], m.to);
+        println!("posted {} -> {} ({})", &id[..8], to_disp, if pushed { "pushed" } else { "local commit — run: claude-mesh sync" });
     }
     heartbeat(&cfg); // any activity refreshes presence (throttled inside)
     Ok(())
+}
+
+/// Sign, write (fast local bus + durable repo bus), and — unless `local` — commit
+/// and push a message. Returns whether the push landed. Shared by `post`, `mesh-say`,
+/// and the live monitor's compose line so all three write bytes identically.
+fn write_and_push(cfg: &Config, mut m: Message, local: bool) -> Result<bool> {
+    // Sign (Ed25519) so recipients can verify it's really from us.
+    if let Ok(sk) = ensure_signing_key() {
+        m.sig = Some(hex::encode(sk.sign(&signable_bytes(&m)).to_bytes()));
+    }
+    let fname = format!("{}-{}-{}.json", now_stamp(), sanitize(&cfg.id), &m.id[..8]);
+    let json = serde_json::to_string_pretty(&m)? + "\n";
+    fs::create_dir_all(local_bus())?;
+    fs::write(local_bus().join(&fname), &json)?; // same-host readers see it without a pull
+    let repo_bus = PathBuf::from(&cfg.repo).join("bus");
+    fs::create_dir_all(&repo_bus)?;
+    fs::write(repo_bus.join(&fname), &json)?; // durable copy in the shared repo
+    if local {
+        return Ok(false);
+    }
+    let rel = format!("bus/{fname}");
+    git(cfg, &["add", &rel])?;
+    commit(cfg, &format!("msg: {}", m.subject))?;
+    let _ = git_ok(cfg, &["pull", "--rebase", "--autostash"]);
+    Ok(git_ok(cfg, &["push"]))
+}
+
+/// Post a line typed into the live monitor. If this node is the owner, it's stamped
+/// `authority=owner` (kind=directive) so sessions treat it as Paul's word; otherwise
+/// it posts as a normal `say` from this node — never a session impersonating the owner.
+fn send_from_monitor(cfg: &Config, to: &str, room: &str, body: &str) -> Result<bool> {
+    let owner = cfg.role == "owner";
+    let subject: String = body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+    let m = Message {
+        v: 1,
+        id: rand_hex(8),
+        from: cfg.id.clone(),
+        to: to.to_string(),
+        ts: now_rfc3339(),
+        kind: if owner { "directive".into() } else { "say".into() },
+        reference: None,
+        subject: if subject.is_empty() { "(message)".into() } else { subject },
+        body: body.trim().to_string(),
+        repo: None,
+        room: room.to_string(),
+        ext: if owner { serde_json::json!({"authority": "owner"}) } else { empty_obj() },
+        sig: None,
+    };
+    write_and_push(cfg, m, false)
 }
 
 fn line(m: &Message) -> String {
@@ -626,7 +670,10 @@ fn cmd_nudge() -> Result<()> {
     // compact one-liner so context isn't flooded.
     let (direct, broadcast): (Vec<&Message>, Vec<&Message>) =
         msgs.iter().partition(|m| &m.to == me || m.to == bare_me);
-    for &m in direct.iter().take(3) {
+    // Show up to this many direct messages in full each nudge; the rest surface via
+    // an explicit "+N more" pointer (bound the count, never truncate a body mid-text).
+    const DIRECT_SHOWN: usize = 6;
+    for &m in direct.iter().take(DIRECT_SHOWN) {
         let sid = &m.id[..m.id.len().min(8)];
         let vs = verify_state(m, &cfg);
         if vs == "FORGED" {
@@ -634,26 +681,23 @@ fn cmd_nudge() -> Result<()> {
             continue;
         }
         let tag = if vs == "verified" { "✓" } else { "unverified" };
-        let body: String = if m.body.chars().count() > 700 {
-            format!("{}…", m.body.chars().take(700).collect::<String>())
-        } else {
-            m.body.clone()
-        };
+        // Direct messages are injected in FULL — no mid-text cut, so the session
+        // acting on it sees the whole thing. Volume is bounded by DIRECT_SHOWN above.
         println!("📨 @you [{tag}] — from {} [{}] «{}» (id {})", m.from, m.room, m.subject, sid);
         if let Some(r) = &m.reference {
             println!("   (re: {})", &r[..r.len().min(8)]);
         }
-        if !body.is_empty() {
-            println!("{body}");
+        if !m.body.is_empty() {
+            println!("{}", m.body);
         }
         println!("   → act on it, then `claude-mesh ack {sid}` (reply: `claude-mesh post --to {} --kind reply --ref {sid} …`)", m.from);
     }
-    if direct.len() > 3 {
-        println!("📨 (+{} more addressed to you — `claude-mesh inbox`)", direct.len() - 3);
+    if direct.len() > DIRECT_SHOWN {
+        println!("📨 (+{} more addressed to you — `claude-mesh inbox`)", direct.len() - DIRECT_SHOWN);
     }
     if !broadcast.is_empty() {
         println!("📨 {} broadcast message(s) — `claude-mesh inbox`:", broadcast.len());
-        for m in broadcast.iter().take(3) {
+        for m in broadcast.iter().take(6) {
             println!("   • {} from {}", m.subject, m.from);
         }
     }
@@ -903,6 +947,7 @@ fn main() -> Result<()> {
         Cmd::Rooms => cmd_rooms(),
         Cmd::Log { room, n, width, full } => cmd_log(room, n, width, full),
         Cmd::Keys => cmd_keys(),
+        Cmd::Monitor { room, full } => monitor::run(room, full),
     }
 }
 
