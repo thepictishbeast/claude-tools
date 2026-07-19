@@ -141,10 +141,8 @@ fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &st
     let end = (start + pane_h).min(total);
 
     queue!(o, Clear(ClearType::All))?;
-    let mut row: u16 = 0;
-    for line in &lines[start..end] {
-        queue!(o, MoveTo(0, row), Print(line))?;
-        row += 1;
+    for (row, line) in lines[start..end].iter().enumerate() {
+        queue!(o, MoveTo(0, row as u16), Print(line))?;
     }
     let sep = rows.saturating_sub(3);
     let mode = format!(

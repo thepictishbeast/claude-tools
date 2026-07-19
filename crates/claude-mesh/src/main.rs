@@ -106,6 +106,9 @@ enum Cmd {
         /// Show the entire message body (no truncation).
         #[arg(long)]
         full: bool,
+        /// Include archived history (archive/YYYYMM/), not just the hot bus.
+        #[arg(long)]
+        all: bool,
     },
     /// List every node's pinned public key (the TOFU key registry).
     Keys,
@@ -131,6 +134,19 @@ enum Cmd {
         /// Start with full message bodies shown (toggle live with Ctrl-F).
         #[arg(long)]
         full: bool,
+    },
+    /// Rotate old messages out of the hot bus into archive/YYYYMM/ (history kept,
+    /// still readable via `read`/`log --all`). Keeps the bus small + fast at scale.
+    Archive {
+        /// Archive messages at least this many days old.
+        #[arg(long, default_value_t = 30)]
+        older_than_days: i64,
+        /// Always keep at least this many of the newest messages in the hot bus.
+        #[arg(long, default_value_t = 200)]
+        keep: usize,
+        /// Show what would move without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -413,16 +429,66 @@ fn read_bus(dir: &PathBuf, into: &mut HashMap<String, Message>) {
     }
 }
 
-/// All known messages (repo bus + local bus), deduped by id, sorted by ts.
-fn all_messages(cfg: &Config) -> Vec<Message> {
-    let mut map = HashMap::new();
-    read_bus(&PathBuf::from(&cfg.repo).join("bus"), &mut map);
-    read_bus(&local_bus(), &mut map);
+fn sorted_msgs(map: HashMap<String, Message>) -> Vec<Message> {
     let mut v: Vec<Message> = map.into_values().collect();
     // ts is second-resolution; tiebreak by id so ordering is deterministic
     // (a live monitor would otherwise jitter same-second messages every refresh).
     v.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
     v
+}
+
+/// HOT messages only — the live `bus/` + local mirror, deduped and sorted. This is
+/// the fast path: nudge/inbox/monitor/default-log read this and never touch the
+/// archive, so the conversation can grow forever without slowing them down.
+fn all_messages(cfg: &Config) -> Vec<Message> {
+    let mut map = HashMap::new();
+    read_bus(&PathBuf::from(&cfg.repo).join("bus"), &mut map);
+    read_bus(&local_bus(), &mut map);
+    sorted_msgs(map)
+}
+
+/// Read archived messages under `archive/YYYYMM/*.json` (one level of month dirs).
+fn read_archive(repo: &str, into: &mut HashMap<String, Message>) {
+    let adir = PathBuf::from(repo).join("archive");
+    for sub in fs::read_dir(&adir).into_iter().flatten().flatten() {
+        let p = sub.path();
+        if p.is_dir() {
+            read_bus(&p, into);
+        }
+    }
+}
+
+/// FULL history — hot bus + local mirror + everything ever archived. Used only by
+/// the retrieval paths (`read <id>`, `ack <id>`, `log --all`) so any message is
+/// always reachable even after it's been rotated out of the hot bus.
+fn full_messages(cfg: &Config) -> Vec<Message> {
+    let mut map = HashMap::new();
+    read_bus(&PathBuf::from(&cfg.repo).join("bus"), &mut map);
+    read_bus(&local_bus(), &mut map);
+    read_archive(&cfg.repo, &mut map);
+    sorted_msgs(map)
+}
+
+/// When was this message created? RFC3339 `ts` first; fall back to file mtime; None
+/// if neither is datable (in which case archival must leave it in the hot bus).
+fn msg_datetime(ts: &str, path: &Path) -> Option<chrono::DateTime<Utc>> {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    let secs = fs::metadata(path).ok()?.modified().ok()?
+        .duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    chrono::DateTime::from_timestamp(secs as i64, 0)
+}
+
+/// Pure archival decision. `ages_days` is oldest-first (same order as the sorted
+/// bus). Keep the newest `keep` regardless; of the rest, archive any that is datable
+/// and at least `older_than_days` old. Undatable (None) is never archived. Returns
+/// the indices to archive. Split out so it's unit-testable without git/fs.
+fn select_archive(ages_days: &[Option<i64>], keep: usize, older_than_days: i64) -> Vec<usize> {
+    let protected_from = ages_days.len().saturating_sub(keep);
+    (0..protected_from)
+        .filter(|&i| matches!(ages_days[i], Some(a) if a >= older_than_days))
+        .collect()
 }
 
 fn addressed_to_me(m: &Message, cfg: &Config) -> bool {
@@ -614,7 +680,7 @@ fn cmd_inbox(count: bool) -> Result<()> {
 
 fn cmd_read(id: String) -> Result<()> {
     let cfg = load_config()?;
-    let m = all_messages(&cfg).into_iter().find(|m| m.id == id || m.id.starts_with(&id));
+    let m = full_messages(&cfg).into_iter().find(|m| m.id == id || m.id.starts_with(&id));
     let m = m.with_context(|| format!("no message matching {id}"))?;
     println!("{}", serde_json::to_string_pretty(&m)?);
     mark_seen(&[m.id]);
@@ -629,7 +695,7 @@ fn cmd_ack(id: Option<String>, all: bool) -> Result<()> {
         mark_seen(&ids);
         println!("acked {n} message(s)");
     } else if let Some(id) = id {
-        let m = all_messages(&cfg).into_iter().find(|m| m.id == id || m.id.starts_with(&id)).with_context(|| format!("no message matching {id}"))?;
+        let m = full_messages(&cfg).into_iter().find(|m| m.id == id || m.id.starts_with(&id)).with_context(|| format!("no message matching {id}"))?;
         mark_seen(&[m.id]);
         println!("acked {id}");
     } else {
@@ -643,6 +709,78 @@ fn cmd_sync() -> Result<()> {
     let pulled = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
     let pushed = git_ok(&cfg, &["push"]);
     println!("sync: pull {} push {}", if pulled { "ok" } else { "skip" }, if pushed { "ok" } else { "skip" });
+    Ok(())
+}
+
+fn cmd_archive(older_than_days: i64, keep: usize, dry_run: bool) -> Result<()> {
+    let cfg = load_config()?;
+    if !dry_run {
+        let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
+    }
+    let bus = PathBuf::from(&cfg.repo).join("bus");
+    // Gather hot-bus message files, sorted oldest-first (the order select_archive expects).
+    let mut items: Vec<(PathBuf, Message)> = Vec::new();
+    for f in fs::read_dir(&bus).into_iter().flatten().flatten() {
+        let p = f.path();
+        if p.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(m) = fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str::<Message>(&s).ok()) {
+            items.push((p, m));
+        }
+    }
+    items.sort_by(|a, b| a.1.ts.cmp(&b.1.ts).then_with(|| a.1.id.cmp(&b.1.id)));
+
+    let now = Utc::now();
+    let ages: Vec<Option<i64>> = items
+        .iter()
+        .map(|(p, m)| msg_datetime(&m.ts, p).map(|dt| (now - dt).num_days()))
+        .collect();
+    let pick = select_archive(&ages, keep, older_than_days);
+    if pick.is_empty() {
+        println!("archive: nothing to move ({} in hot bus, keep {keep}, older-than {older_than_days}d)", items.len());
+        return Ok(());
+    }
+
+    let mut moved = 0usize;
+    for &i in &pick {
+        let (src, m) = &items[i];
+        let dt = match msg_datetime(&m.ts, src) {
+            Some(d) => d,
+            None => continue, // undatable: leave it in the hot bus
+        };
+        let ym = dt.format("%Y%m").to_string();
+        let fname = match src.file_name() {
+            Some(n) => n.to_string_lossy().to_string(),
+            None => continue,
+        };
+        let destdir = PathBuf::from(&cfg.repo).join("archive").join(&ym);
+        let dest = destdir.join(&fname);
+        if dry_run {
+            println!("  would archive {}  ({}d)  -> archive/{ym}/{fname}", &m.id[..m.id.len().min(8)], (now - dt).num_days());
+            moved += 1;
+            continue;
+        }
+        fs::create_dir_all(&destdir)?;
+        fs::rename(src, &dest).with_context(|| format!("archiving {}", src.display()))?;
+        let _ = fs::remove_file(local_bus().join(&fname)); // drop the fast-path mirror so it can't resurface
+        moved += 1;
+    }
+
+    if dry_run {
+        println!("archive --dry-run: {moved} message(s) would move; nothing changed");
+        return Ok(());
+    }
+    // Stage the archive additions AND the bus deletions in one shot, then commit.
+    git(&cfg, &["add", "-A", "--", "archive", "bus"])?;
+    commit(&cfg, &format!("archive: {moved} message(s) older than {older_than_days}d -> archive/"))?;
+    let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
+    let pushed = git_ok(&cfg, &["push"]);
+    println!(
+        "archived {moved} message(s) -> archive/ ({}); hot bus now {} message(s)",
+        if pushed { "pushed" } else { "local commit — run: claude-mesh sync" },
+        items.len() - moved
+    );
     Ok(())
 }
 
@@ -861,11 +999,12 @@ fn sender_color(id: &str) -> &'static str {
     let h = id.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
     PAL[(h as usize) % PAL.len()]
 }
-fn cmd_log(room: Option<String>, n: usize, width: usize, full: bool) -> Result<()> {
+fn cmd_log(room: Option<String>, n: usize, width: usize, full: bool, all: bool) -> Result<()> {
     let cfg = load_config()?;
     let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
     let want: Vec<String> = room.map(|r| vec![r]).unwrap_or_else(|| cfg.rooms.clone());
-    let msgs: Vec<Message> = all_messages(&cfg).into_iter().filter(|m| want.contains(&m.room)).collect();
+    let pool = if all { full_messages(&cfg) } else { all_messages(&cfg) };
+    let msgs: Vec<Message> = pool.into_iter().filter(|m| want.contains(&m.room)).collect();
     let start = msgs.len().saturating_sub(n);
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let w = (if width == 0 { 100 } else { width }).clamp(32, 240);
@@ -945,9 +1084,10 @@ fn main() -> Result<()> {
         Cmd::Leave => cmd_leave(),
         Cmd::Join { room } => cmd_join(room),
         Cmd::Rooms => cmd_rooms(),
-        Cmd::Log { room, n, width, full } => cmd_log(room, n, width, full),
+        Cmd::Log { room, n, width, full, all } => cmd_log(room, n, width, full, all),
         Cmd::Keys => cmd_keys(),
         Cmd::Monitor { room, full } => monitor::run(room, full),
+        Cmd::Archive { older_than_days, keep, dry_run } => cmd_archive(older_than_days, keep, dry_run),
     }
 }
 
@@ -980,5 +1120,30 @@ mod tests {
     #[test]
     fn empty_git_user_no_sudo() {
         assert_eq!(sudo_target(Some(""), "root", exists), None);
+    }
+
+    use super::select_archive;
+    // ages are OLDEST-first: 100d, 40d, undatable, 10d, 5d.
+    const AGES: [Option<i64>; 5] = [Some(100), Some(40), None, Some(10), Some(5)];
+
+    #[test]
+    fn archive_keeps_newest_and_respects_age() {
+        // keep newest 1 (the 5d msg); of the remaining 4, archive those >=30d.
+        // idx0=100 yes, idx1=40 yes, idx2=None never, idx3=10 no.
+        assert_eq!(select_archive(&AGES, 1, 30), vec![0, 1]);
+    }
+    #[test]
+    fn archive_keep_floor_protects_everything() {
+        assert!(select_archive(&AGES, 99, 30).is_empty());
+    }
+    #[test]
+    fn archive_threshold_zero_takes_all_datable_but_protected() {
+        // keep 1 (idx4), threshold 0: idx0/1/3 datable -> archived; idx2 undatable skipped.
+        assert_eq!(select_archive(&AGES, 1, 0), vec![0, 1, 3]);
+    }
+    #[test]
+    fn archive_never_touches_undatable() {
+        // even with keep 0 and threshold 0, the None at idx2 is never selected.
+        assert_eq!(select_archive(&AGES, 0, 0), vec![0, 1, 3, 4]);
     }
 }
