@@ -98,6 +98,12 @@ enum Cmd {
         /// How many recent messages to show.
         #[arg(long, short = 'n', default_value_t = 25)]
         n: usize,
+        /// Wrap width in columns (0 = default 100; the `mesh` wrapper passes the real terminal width).
+        #[arg(long, default_value_t = 0)]
+        width: usize,
+        /// Show the entire message body (no truncation).
+        #[arg(long)]
+        full: bool,
     },
     /// List every node's pinned public key (the TOFU key registry).
     Keys,
@@ -402,7 +408,9 @@ fn all_messages(cfg: &Config) -> Vec<Message> {
     read_bus(&PathBuf::from(&cfg.repo).join("bus"), &mut map);
     read_bus(&local_bus(), &mut map);
     let mut v: Vec<Message> = map.into_values().collect();
-    v.sort_by(|a, b| a.ts.cmp(&b.ts));
+    // ts is second-resolution; tiebreak by id so ordering is deterministic
+    // (a live monitor would otherwise jitter same-second messages every refresh).
+    v.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
     v
 }
 
@@ -437,7 +445,15 @@ fn unread(cfg: &Config) -> Vec<Message> {
     let seen = load_seen();
     all_messages(cfg)
         .into_iter()
-        .filter(|m| m.from != cfg.id && cfg.rooms.contains(&m.room) && addressed_to_me(m, cfg) && !seen.contains(&m.id))
+        .filter(|m| {
+            m.from != cfg.id
+                && addressed_to_me(m, cfg)
+                && !seen.contains(&m.id)
+                // Room-scope only true broadcasts (all / role:). A message aimed at my
+                // exact id (or role@host) must deliver regardless of which rooms I've
+                // joined — otherwise a point-to-point message is silently swallowed.
+                && (m.to == cfg.id || m.to == bare(cfg) || cfg.rooms.contains(&m.room))
+        })
         .collect()
 }
 
@@ -755,41 +771,94 @@ fn cmd_rooms() -> Result<()> {
     }
     Ok(())
 }
-fn cmd_log(room: Option<String>, n: usize) -> Result<()> {
+/// Word-wrap `text` to `width` columns, indenting each line. Nothing runs off
+/// the right edge — this is what stops messages getting cut off on a small screen.
+fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
+    let w = width.max(24);
+    let ind = indent.chars().count();
+    let avail = w.saturating_sub(ind).max(1); // usable columns after the indent
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::from(indent);
+        let mut len = ind;
+        for word in para.split_whitespace() {
+            // Hard-break any token too long to ever fit a line (hex ids, sigs, URLs —
+            // which fill the bus). Without this it overflows and gets cut on the right.
+            let pieces: Vec<String> = if word.chars().count() > avail {
+                word.chars().collect::<Vec<_>>().chunks(avail).map(|c| c.iter().collect()).collect()
+            } else {
+                vec![word.to_string()]
+            };
+            for piece in pieces {
+                let pl = piece.chars().count();
+                if len > ind && len + 1 + pl > w {
+                    out.push(std::mem::replace(&mut line, String::from(indent)));
+                    len = ind;
+                }
+                if len > ind {
+                    line.push(' ');
+                    len += 1;
+                }
+                line.push_str(&piece);
+                len += pl;
+            }
+        }
+        out.push(line);
+    }
+    out
+}
+/// A stable colour per sender id, so each session reads as one voice.
+fn sender_color(id: &str) -> &'static str {
+    const PAL: [&str; 6] = ["\x1b[1;36m", "\x1b[1;32m", "\x1b[1;33m", "\x1b[1;35m", "\x1b[1;34m", "\x1b[1;91m"];
+    let h = id.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    PAL[(h as usize) % PAL.len()]
+}
+fn cmd_log(room: Option<String>, n: usize, width: usize, full: bool) -> Result<()> {
     let cfg = load_config()?;
     let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
     let want: Vec<String> = room.map(|r| vec![r]).unwrap_or_else(|| cfg.rooms.clone());
     let msgs: Vec<Message> = all_messages(&cfg).into_iter().filter(|m| want.contains(&m.room)).collect();
     let start = msgs.len().saturating_sub(n);
-    // Colour only when writing to a real terminal (so piped output stays clean).
     let tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    let (cf, cs, cbad, cok, cd, rst) = if tty {
-        ("\x1b[1;36m", "\x1b[1m", "\x1b[1;31m", "\x1b[32m", "\x1b[2m", "\x1b[0m")
+    let w = (if width == 0 { 100 } else { width }).clamp(32, 240);
+    let (cs, cbad, cok, cd, rst) = if tty {
+        ("\x1b[1m", "\x1b[1;31m", "\x1b[32m", "\x1b[2m", "\x1b[0m")
     } else {
-        ("", "", "", "", "", "")
+        ("", "", "", "", "")
     };
-    println!("{cd}── conversation in [{}] · showing {} of {} ──{rst}", want.join(","), msgs.len() - start, msgs.len());
+    println!("{cd}── [{}] · {} of {} · {} cols{} ──{rst}", want.join(","), msgs.len() - start, msgs.len(), w, if full { " · full" } else { "" });
     for m in &msgs[start..] {
-        println!(); // a blank line between messages — easier to scan on a small screen
+        println!(); // blank line between messages
+        let sc = if tty { sender_color(&m.from) } else { "" };
         let hhmm = m.ts.get(11..16).unwrap_or(m.ts.as_str());
         let vmark = match verify_state(m, &cfg) {
             "verified" => format!("{cok}✓{rst}"),
             "FORGED" => format!("{cbad}‼FORGED{rst}"),
             _ => String::new(),
         };
-        // header on its own short line (mobile-friendly), then subject, then body.
-        println!("{cf}{}{rst} {cd}{} · {} · → {}{rst} {}", m.from, hhmm, m.room, m.to, vmark);
-        println!("  {cs}{}{rst}", m.subject);
+        println!("{sc}{}{rst} {cd}{} · {} → {}{rst} {}", m.from, hhmm, m.room, m.to, vmark);
+        for line in wrap(m.subject.trim(), w, "  ") {
+            println!("{cs}{line}{rst}");
+        }
         if let Some(r) = &m.reference {
             println!("  {cd}↩ re {}{rst}", &r[..r.len().min(6)]);
         }
         let body = m.body.trim();
         if !body.is_empty() {
-            for line in body.chars().take(500).collect::<String>().lines() {
-                println!("  {line}");
+            let shown = if full || body.chars().count() <= 400 {
+                body.to_string()
+            } else {
+                format!("{}…", body.chars().take(400).collect::<String>())
+            };
+            for line in wrap(&shown, w, "  ") {
+                println!("{line}");
             }
-            if body.chars().count() > 500 {
-                println!("  {cd}… full: claude-mesh read {}{rst}", &m.id[..m.id.len().min(8)]);
+            if !full && body.chars().count() > 400 {
+                println!("  {cd}(full: mesh --full-context, or claude-mesh read {}){rst}", &m.id[..m.id.len().min(8)]);
             }
         }
     }
@@ -832,7 +901,7 @@ fn main() -> Result<()> {
         Cmd::Leave => cmd_leave(),
         Cmd::Join { room } => cmd_join(room),
         Cmd::Rooms => cmd_rooms(),
-        Cmd::Log { room, n } => cmd_log(room, n),
+        Cmd::Log { room, n, width, full } => cmd_log(room, n, width, full),
         Cmd::Keys => cmd_keys(),
     }
 }
