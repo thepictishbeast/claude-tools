@@ -40,7 +40,9 @@ enum Cmd {
         /// Append '#<sid8>' to the id (for multiple same-role sessions on one host).
         #[arg(long)]
         sid: Option<String>,
-        /// Run git as this user (when the tool runs as root but the repo is not root's).
+        /// LOCAL unix user to run git as — used ONLY when it differs from the
+        /// current user and exists (e.g. prime: root tool, paul-owned repo).
+        /// NOT the GitHub repo owner. Omit on a box where you already own the clone.
         #[arg(long)]
         git_user: Option<String>,
     },
@@ -182,8 +184,39 @@ fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
 }
 
+/// The current effective unix user (`id -un`), falling back to $USER then root.
+fn current_user() -> String {
+    Command::new("id").arg("-un").output().ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var("USER").ok())
+        .unwrap_or_else(|| "root".into())
+}
+/// Is `u` a real local unix account? (`id -u <u>` succeeds)
+fn user_exists(u: &str) -> bool {
+    Command::new("id").arg("-u").arg(u).output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Decide which user (if any) git should be `sudo -u`'d to. Pure so it can be
+/// tested: escalate ONLY to a real local account different from the current one.
+fn sudo_target(git_user: Option<&str>, current: &str, exists: impl Fn(&str) -> bool) -> Option<String> {
+    git_user
+        .filter(|u| !u.is_empty() && *u != current && exists(u))
+        .map(|u| u.to_string())
+}
+
 fn git(cfg: &Config, args: &[&str]) -> Result<String> {
-    let mut cmd = match &cfg.git_user {
+    // `git_user` names the LOCAL unix account git should run as. Only escalate
+    // with `sudo -u` when it is a real local user DIFFERENT from the current one
+    // (the prime case: Claude runs as root, the repo is paul's). If it is unset,
+    // equals the current user, or is not a local account at all (a cross-device
+    // node that was mis-told to pass the GitHub repo-owner), run git directly as
+    // the current user — who already owns the clone + token. This is what makes
+    // cross-device nodes work; before, any non-local git_user hard-failed sudo.
+    let cur = current_user();
+    let sudo_as = sudo_target(cfg.git_user.as_deref(), &cur, user_exists);
+    let mut cmd = match sudo_as.as_deref() {
         Some(u) => {
             let mut c = Command::new("sudo");
             c.arg("-u").arg(u).arg("git");
@@ -431,5 +464,37 @@ fn main() -> Result<()> {
         Cmd::Ack { id, all } => cmd_ack(id, all),
         Cmd::Sync => cmd_sync(),
         Cmd::Nudge => cmd_nudge(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sudo_target;
+
+    // Local accounts on the test's mental model: root + paul + admin exist.
+    fn exists(u: &str) -> bool { matches!(u, "root" | "paul" | "admin") }
+
+    #[test]
+    fn prime_root_tool_paul_repo_escalates() {
+        // prime: tool runs as root, repo owned by paul -> sudo -u paul.
+        assert_eq!(sudo_target(Some("paul"), "root", exists), Some("paul".into()));
+    }
+    #[test]
+    fn cross_device_github_owner_does_not_escalate() {
+        // THE BUG: a node mis-told to pass the GitHub repo owner. Not a local
+        // user -> run git directly as the current user instead of failing sudo.
+        assert_eq!(sudo_target(Some("thepictishbeast"), "admin", exists), None);
+    }
+    #[test]
+    fn git_user_equals_current_no_redundant_sudo() {
+        assert_eq!(sudo_target(Some("admin"), "admin", exists), None);
+    }
+    #[test]
+    fn unset_git_user_no_sudo() {
+        assert_eq!(sudo_target(None, "root", exists), None);
+    }
+    #[test]
+    fn empty_git_user_no_sudo() {
+        assert_eq!(sudo_target(Some(""), "root", exists), None);
     }
 }
