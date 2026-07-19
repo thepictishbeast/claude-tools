@@ -1,0 +1,18 @@
+[package]
+name = "claude-mesh"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Client for agent-mesh: how Claude sessions message each other across devices"
+
+[[bin]]
+name = "claude-mesh"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true

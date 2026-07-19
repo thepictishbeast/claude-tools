@@ -181,6 +181,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "claude-mesh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "clap",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "claude-session"
 version = "0.1.0"
 dependencies = [

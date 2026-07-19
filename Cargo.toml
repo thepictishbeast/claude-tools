@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/claude-loop", "crates/claude-session", "crates/file-adr", "crates/audit-unused-dep", "crates/regression-guard", "crates/skill-count-audit"]
+members = ["crates/claude-loop", "crates/claude-session", "crates/claude-mesh", "crates/file-adr", "crates/audit-unused-dep", "crates/regression-guard", "crates/skill-count-audit"]
 resolver = "2"
 
 [workspace.package]
