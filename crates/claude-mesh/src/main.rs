@@ -524,10 +524,37 @@ fn cmd_nudge() -> Result<()> {
     if msgs.is_empty() {
         return Ok(());
     }
-    let subjects: Vec<String> = msgs.iter().take(3).map(|m| format!("{} from {}", m.subject, m.from)).collect();
-    println!("📨 {} new agent-mesh message(s) for {} — `claude-mesh inbox`", msgs.len(), cfg.id);
-    for s in subjects {
-        println!("   • {s}");
+    let me = &cfg.id;
+    let bare_me = bare(&cfg);
+    // A DIRECT @mention (to my exact id or my role@host) is injected in FULL so the
+    // session acts on it straight from context. Broadcasts (all / role:) stay a
+    // compact one-liner so context isn't flooded.
+    let (direct, broadcast): (Vec<&Message>, Vec<&Message>) =
+        msgs.iter().partition(|m| &m.to == me || m.to == bare_me);
+    for m in direct.iter().take(3) {
+        let sid = &m.id[..m.id.len().min(8)];
+        let body: String = if m.body.chars().count() > 700 {
+            format!("{}…", m.body.chars().take(700).collect::<String>())
+        } else {
+            m.body.clone()
+        };
+        println!("📨 @you — from {} [{}] «{}» (id {})", m.from, m.room, m.subject, sid);
+        if let Some(r) = &m.reference {
+            println!("   (re: {})", &r[..r.len().min(8)]);
+        }
+        if !body.is_empty() {
+            println!("{body}");
+        }
+        println!("   → act on it, then `claude-mesh ack {sid}` (reply: `claude-mesh post --to {} --kind reply --ref {sid} …`)", m.from);
+    }
+    if direct.len() > 3 {
+        println!("📨 (+{} more addressed to you — `claude-mesh inbox`)", direct.len() - 3);
+    }
+    if !broadcast.is_empty() {
+        println!("📨 {} broadcast message(s) — `claude-mesh inbox`:", broadcast.len());
+        for m in broadcast.iter().take(3) {
+            println!("   • {} from {}", m.subject, m.from);
+        }
     }
     Ok(())
 }
