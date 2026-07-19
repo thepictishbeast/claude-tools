@@ -89,6 +89,15 @@ enum Cmd {
     },
     /// List rooms seen in the bus and which I've joined.
     Rooms,
+    /// Read a room's recent conversation — ALL messages, not just ones for me.
+    Log {
+        /// Room to read (default: your joined rooms).
+        #[arg(long)]
+        room: Option<String>,
+        /// How many recent messages to show.
+        #[arg(long, short = 'n', default_value_t = 25)]
+        n: usize,
+    },
     /// Print one message (id or id-prefix) and mark it seen.
     Read {
         id: String,
@@ -634,6 +643,19 @@ fn cmd_rooms() -> Result<()> {
     }
     Ok(())
 }
+fn cmd_log(room: Option<String>, n: usize) -> Result<()> {
+    let cfg = load_config()?;
+    let _ = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
+    let want: Vec<String> = room.map(|r| vec![r]).unwrap_or_else(|| cfg.rooms.clone());
+    let msgs: Vec<Message> = all_messages(&cfg).into_iter().filter(|m| want.contains(&m.room)).collect();
+    let start = msgs.len().saturating_sub(n);
+    println!("conversation in [{}] — {} of {} message(s):", want.join(","), msgs.len() - start, msgs.len());
+    for m in &msgs[start..] {
+        let refd = m.reference.as_deref().map(|r| format!(" ↩{}", &r[..r.len().min(6)])).unwrap_or_default();
+        println!("  {}  {:<22} → {:<18} [{}]{} {}", m.ts, m.from, m.to, m.room, refd, m.subject);
+    }
+    Ok(())
+}
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -651,6 +673,7 @@ fn main() -> Result<()> {
         Cmd::Leave => cmd_leave(),
         Cmd::Join { room } => cmd_join(room),
         Cmd::Rooms => cmd_rooms(),
+        Cmd::Log { room, n } => cmd_log(room, n),
     }
 }
 
