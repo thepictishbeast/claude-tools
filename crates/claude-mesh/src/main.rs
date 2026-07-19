@@ -95,6 +95,9 @@ struct Config {
     id: String,
     role: String,
     host: String,
+    /// The enforced per-session suffix. `id` is always `role@host#<sid8>`.
+    #[serde(default)]
+    sid8: Option<String>,
     repo: String,
     /// If set, git runs as this user (`sudo -u <user> git`). Use when the tool
     /// runs as root but the repo is owned by someone else (root agent, paul repo).
@@ -162,7 +165,17 @@ fn load_config() -> Result<Config> {
     let p = config_path();
     let s = fs::read_to_string(&p)
         .with_context(|| format!("no mesh config at {} — run: claude-mesh init --role <role>", p.display()))?;
-    Ok(serde_json::from_str(&s)?)
+    let mut cfg: Config = serde_json::from_str(&s)?;
+    // ENFORCE the #sid8 suffix: a legacy bare id (role@host) is upgraded in
+    // memory so every code path sees a unique, collision-proof id.
+    if !cfg.id.contains('#') {
+        let sid8 = cfg.sid8.clone().unwrap_or_else(|| derive_sid8(None));
+        cfg.id = format!("{}@{}#{}", cfg.role, cfg.host, sid8);
+        cfg.sid8 = Some(sid8);
+    } else if cfg.sid8.is_none() {
+        cfg.sid8 = cfg.id.split('#').nth(1).map(str::to_string);
+    }
+    Ok(cfg)
 }
 
 fn rand_hex(n: usize) -> String {
@@ -182,6 +195,30 @@ fn now_stamp() -> String {
 
 fn sanitize(s: &str) -> String {
     s.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect()
+}
+
+/// The mandatory per-session suffix. Every node id is `role@host#<sid8>`, so two
+/// sessions picking the same role+host can never collide. Priority: explicit
+/// override > first 8 of $CLAUDE_CODE_SESSION_ID > random (still unique).
+fn derive_sid8(explicit: Option<String>) -> String {
+    if let Some(s) = explicit {
+        let s: String = sanitize(&s).chars().take(8).collect();
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    if let Ok(sid) = env::var("CLAUDE_CODE_SESSION_ID") {
+        if sid.len() >= 8 {
+            return sid[..8].to_string();
+        }
+    }
+    rand_hex(4) // 8 hex chars
+}
+
+/// The host-scoped role prefix `role@host` (an id with the #sid8 stripped).
+/// Addressing a message here reaches every session of that role on that host.
+fn bare(cfg: &Config) -> String {
+    format!("{}@{}", cfg.role, cfg.host)
 }
 
 /// The current effective unix user (`id -un`), falling back to $USER then root.
@@ -259,7 +296,11 @@ fn all_messages(cfg: &Config) -> Vec<Message> {
 }
 
 fn addressed_to_me(m: &Message, cfg: &Config) -> bool {
-    m.to == cfg.id || m.to == "all" || m.to == format!("role:{}", cfg.role)
+    m.to == cfg.id                              // this exact session
+        || m.to == "all"                        // everyone
+        || m.to == format!("role:{}", cfg.role) // every session of my role, any host
+        || m.to == bare(cfg)                    // role@host — host-scoped role broadcast
+                                                 // (also delivers legacy bare-addressed messages)
 }
 
 fn load_seen() -> HashSet<String> {
@@ -294,11 +335,9 @@ fn cmd_init(role: String, host: Option<String>, repo: Option<PathBuf>, sid: Opti
         Command::new("hostname").output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).filter(|s| !s.is_empty()).unwrap_or_else(|| "localhost".into())
     });
     let repo = repo.unwrap_or_else(|| PathBuf::from("/home/paul/projects/agent-mesh"));
-    let mut id = format!("{role}@{host}");
-    if let Some(s) = sid {
-        id = format!("{id}#{s}");
-    }
-    let cfg = Config { id: id.clone(), role, host, repo: repo.to_string_lossy().to_string(), git_user };
+    let sid8 = derive_sid8(sid);
+    let id = format!("{role}@{host}#{sid8}"); // enforced: never bare
+    let cfg = Config { id: id.clone(), role, host, sid8: Some(sid8), repo: repo.to_string_lossy().to_string(), git_user };
     fs::create_dir_all(session_dir())?;
     fs::create_dir_all(local_bus())?;
     fs::write(config_path(), serde_json::to_string_pretty(&cfg)? + "\n")?;
