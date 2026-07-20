@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use crossterm::{
     cursor::{MoveTo, Show},
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute, queue,
     style::Print,
     terminal::{self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
@@ -36,13 +36,16 @@ struct TermGuard;
 impl TermGuard {
     fn enter() -> Result<Self> {
         enable_raw_mode()?;
-        execute!(stdout(), EnterAlternateScreen)?;
+        // Bracketed paste: the terminal wraps a paste in \e[200~ … \e[201~ so it
+        // arrives as ONE Event::Paste instead of a stream of keystrokes + Enters
+        // (which is why multi-line pastes used to fire a send per line).
+        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
         Ok(TermGuard)
     }
 }
 impl Drop for TermGuard {
     fn drop(&mut self) {
-        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(stdout(), Show, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
 }
@@ -50,7 +53,7 @@ impl Drop for TermGuard {
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), Show, LeaveAlternateScreen);
+        let _ = execute!(stdout(), Show, DisableBracketedPaste, LeaveAlternateScreen);
         let _ = disable_raw_mode();
         prev(info);
     }));
@@ -130,6 +133,21 @@ fn build_lines(cfg: &Config, msgs: &[Message], width: usize, view: &View) -> Vec
     out
 }
 
+/// Render one compose field to a single visible line: newlines shown as ⏎ (a
+/// pasted multi-line body stays on one line), and if it's longer than `avail`
+/// columns, show the tail (so the cursor end stays visible). Returns the display
+/// string and the cursor column offset within the field.
+fn field_line(text: &str, avail: usize) -> (String, usize) {
+    let disp: String = text.replace(['\n', '\r'], "⏎");
+    let n = disp.chars().count();
+    if n <= avail {
+        (disp, n)
+    } else {
+        let tail: String = disp.chars().skip(n - avail.saturating_sub(1)).collect();
+        (format!("…{tail}"), avail) // cursor sits at the right edge
+    }
+}
+
 fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &str) -> Result<()> {
     let mut o = stdout();
     let pane_h = rows.saturating_sub(4).max(1) as usize; // reserve: separator + status + subject + body
@@ -172,11 +190,13 @@ fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &st
     } else {
         ("\x1b[2mSubj›\x1b[0m ", "\x1b[1;36m›\x1b[0m ")
     };
-    queue!(o, MoveTo(0, sep + 2), Clear(ClearType::CurrentLine), Print(format!("{subj_p}{}", view.subject)))?;
-    queue!(o, MoveTo(0, sep + 3), Clear(ClearType::CurrentLine), Print(format!("{body_p}{}", view.input)))?;
+    let (subj_disp, subj_cur) = field_line(&view.subject, (cols as usize).saturating_sub(6));
+    let (body_disp, body_cur) = field_line(&view.input, (cols as usize).saturating_sub(2));
+    queue!(o, MoveTo(0, sep + 2), Clear(ClearType::CurrentLine), Print(format!("{subj_p}{subj_disp}")))?;
+    queue!(o, MoveTo(0, sep + 3), Clear(ClearType::CurrentLine), Print(format!("{body_p}{body_disp}")))?;
     // Park the cursor in whichever field has focus (prompt widths: "Subj› " = 6, "› " = 2).
-    let (crow, base, text) = if view.subject_focus { (sep + 2, 6u16, &view.subject) } else { (sep + 3, 2u16, &view.input) };
-    let col = (base + text.chars().count() as u16).min(cols.saturating_sub(1));
+    let (crow, base, cur) = if view.subject_focus { (sep + 2, 6u16, subj_cur) } else { (sep + 3, 2u16, body_cur) };
+    let col = (base + cur as u16).min(cols.saturating_sub(1));
     queue!(o, MoveTo(col, crow), Show)?;
     o.flush()?;
     Ok(())
@@ -225,7 +245,19 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
         }
 
         if event::poll(Duration::from_millis(150))? {
-            if let Event::Key(k) = event::read()? {
+            match event::read()? {
+                Event::Paste(text) => {
+                    // The whole paste (newlines and all) enters the focused field as one
+                    // chunk — never a run of Enters — so multi-line pastes stop firing a
+                    // send per line. Subject is single-line, so flatten newlines there.
+                    if view.subject_focus {
+                        view.subject.push_str(&text.replace(['\n', '\r'], " "));
+                    } else {
+                        view.input.push_str(&text);
+                    }
+                    dirty = true;
+                }
+                Event::Key(k) => {
                 if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                     continue;
                 }
@@ -273,9 +305,8 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
                     _ => {}
                 }
                 dirty = true;
-            } else {
-                // resize or other event — just repaint
-                dirty = true;
+                }
+                _ => dirty = true, // resize / focus / other — just repaint
             }
         }
     }
