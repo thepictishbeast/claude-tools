@@ -1,232 +1,362 @@
-//! Live full-screen mesh monitor (`claude-mesh monitor`).
+//! Live full-screen mesh monitor (`claude-mesh monitor`) — ratatui rebuild.
 //!
-//! A stays-open view of the conversation that you can also TYPE INTO — compose a
-//! reply on the bottom line and press Enter to post it, without leaving the view.
-//! Built on crossterm's raw mode only (no ratatui) so it reuses the crate's own
-//! `wrap()` + `sender_color()` ANSI helpers directly and word-wraps to the live
-//! terminal width — nothing gets cut off on the right on a small/phone screen.
+//! A polished, stays-open view of the conversation you can type into: bordered
+//! panes, per-session colour, a real scrollback, a multi-line paste-safe compose
+//! box, live presence, friendly names (the owner is just "Paul"; duplicate roles
+//! disambiguate as governor¹/governor²), and an @-picker that addresses a specific
+//! session so the message injects into that session's next prompt.
 //!
-//! Design notes that matter:
-//!   * A RAII guard + panic hook always restore the terminal (leave alt-screen,
-//!     disable raw mode). A crashed TUI must never strand a phone-SSH session.
-//!   * git pull/push runs on a background thread; the UI never blocks on the
-//!     network (and we never pull on every refresh — that would hit the same
-//!     secondary-rate-limit we already saw).
-//!   * Messages render from the LOCAL bus on disk each tick; the sync thread just
-//!     refreshes those files underneath us.
+//! Rendering is ratatui; the network (git pull/push) runs off-thread so the UI
+//! never blocks, and messages render from the LOCAL bus each tick.
 
-use std::io::{stdout, Write};
+use std::collections::HashMap;
+use std::fs;
+use std::io::stdout;
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use crossterm::{
-    cursor::{MoveTo, Show},
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
-    execute, queue,
-    style::Print,
-    terminal::{self, disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
+use chrono::Utc;
+use ratatui::{
+    crossterm::{
+        event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind, KeyModifiers},
+        execute,
+    },
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
+    Frame,
 };
 
-use crate::{all_messages, load_config, sender_color, send_from_monitor, verify_state, Config, Message};
+use crate::{all_messages, load_config, send_from_monitor, verify_state, Config, Message};
 
-/// Restores the terminal on drop no matter how we leave (return, `?`, or panic).
-struct TermGuard;
-impl TermGuard {
-    fn enter() -> Result<Self> {
-        enable_raw_mode()?;
-        // Bracketed paste: the terminal wraps a paste in \e[200~ … \e[201~ so it
-        // arrives as ONE Event::Paste instead of a stream of keystrokes + Enters
-        // (which is why multi-line pastes used to fire a send per line).
-        execute!(stdout(), EnterAlternateScreen, EnableBracketedPaste)?;
-        Ok(TermGuard)
+const PRESENCE_TTL: i64 = 900;
+
+// ── friendly names ────────────────────────────────────────────────────────────
+fn role_of(id: &str) -> String {
+    id.split('@').next().unwrap_or(id).to_string()
+}
+
+/// Map canonical ids (role@host#sid8) → clean display names. The owner is just
+/// "Paul". Everyone else is their bare role ("governor", "substrate") — a number
+/// is added ONLY when two or more of that role are present at the same time
+/// (governor 1, governor 2), so you never see noise like `#adc1a8f3` or a stray
+/// superscript on a lone session.
+fn display_map(all_ids: &[String], present: &[String]) -> HashMap<String, String> {
+    let mut pres: Vec<String> = present.to_vec();
+    pres.sort();
+    pres.dedup();
+    let mut present_by_role: HashMap<String, Vec<String>> = HashMap::new();
+    for id in &pres {
+        present_by_role.entry(role_of(id)).or_default().push(id.clone());
+    }
+    let mut numbered: HashMap<String, String> = HashMap::new();
+    for (role, list) in &present_by_role {
+        if list.len() > 1 && role != "owner" {
+            for (i, id) in list.iter().enumerate() {
+                numbered.insert(id.clone(), format!("{role} {}", i + 1));
+            }
+        }
+    }
+    let mut out = HashMap::new();
+    let mut all: Vec<String> = all_ids.to_vec();
+    all.sort();
+    all.dedup();
+    for id in &all {
+        let name = if let Some(n) = numbered.get(id) {
+            n.clone()
+        } else if role_of(id) == "owner" {
+            "Paul".to_string()
+        } else {
+            role_of(id)
+        };
+        out.insert(id.clone(), name);
+    }
+    out
+}
+fn short(id: &str) -> String {
+    role_of(id)
+}
+fn name_of(map: &HashMap<String, String>, id: &str) -> String {
+    map.get(id).cloned().unwrap_or_else(|| short(id))
+}
+
+/// A stable colour per display name so each session reads as one voice.
+fn sender_color(name: &str) -> Color {
+    if name == "Paul" {
+        return Color::White;
+    }
+    const PAL: [Color; 6] = [Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::LightBlue, Color::LightRed];
+    let h = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    PAL[(h as usize) % PAL.len()]
+}
+
+// ── data ───────────────────────────────────────────────────────────────────────
+fn load_msgs(cfg: &Config, room: &Option<String>) -> Vec<Message> {
+    let want: Vec<String> = room.clone().map(|r| vec![r]).unwrap_or_else(|| cfg.rooms.clone());
+    all_messages(cfg).into_iter().filter(|m| want.contains(&m.room)).collect()
+}
+
+/// Ids currently present (a `nodes/*.status` heartbeat within the TTL).
+fn present_ids(cfg: &Config) -> Vec<String> {
+    let dir = PathBuf::from(&cfg.repo).join("nodes");
+    let now = Utc::now();
+    let mut out = Vec::new();
+    for f in fs::read_dir(&dir).into_iter().flatten().flatten() {
+        if let Some(v) = fs::read_to_string(f.path()).ok().and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()) {
+            if let (Some(id), Some(ls)) = (v.get("id").and_then(|x| x.as_str()), v.get("last_seen").and_then(|x| x.as_str())) {
+                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ls) {
+                    let age = (now - dt.with_timezone(&Utc)).num_seconds();
+                    if (0..PRESENCE_TTL).contains(&age) {
+                        out.push(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+// ── app state ───────────────────────────────────────────────────────────────────
+#[derive(PartialEq)]
+enum Focus {
+    Subject,
+    Body,
+}
+struct App {
+    cfg: Config,
+    room: Option<String>,
+    room_label: String,
+    msgs: Vec<Message>,
+    present: Vec<String>,
+    names: HashMap<String, String>,
+    scroll: usize, // lines up from the bottom; 0 = pinned to latest
+    full: bool,
+    subject: String,
+    body: String,
+    focus: Focus,
+    to: String,          // recipient id, or "all"
+    to_label: String,    // friendly recipient label
+    picker: Option<usize>, // Some(selected) when the @-picker is open
+    status: String,
+}
+
+impl App {
+    fn refresh(&mut self) {
+        self.msgs = load_msgs(&self.cfg, &self.room);
+        self.present = present_ids(&self.cfg);
+        let mut ids: Vec<String> = self.msgs.iter().map(|m| m.from.clone()).collect();
+        ids.extend(self.present.iter().cloned());
+        ids.push(self.cfg.id.clone());
+        self.names = display_map(&ids, &self.present);
+        self.to_label = if self.to == "all" { "everyone".into() } else { name_of(&self.names, &self.to) };
+    }
+    fn insert(&mut self, s: &str) {
+        match self.focus {
+            Focus::Subject => self.subject.push_str(&s.replace(['\n', '\r'], " ")),
+            Focus::Body => self.body.push_str(s),
+        }
+    }
+    fn backspace(&mut self) {
+        match self.focus {
+            Focus::Subject => { self.subject.pop(); }
+            Focus::Body => { self.body.pop(); }
+        }
     }
 }
-impl Drop for TermGuard {
-    fn drop(&mut self) {
-        let _ = execute!(stdout(), Show, DisableBracketedPaste, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
+
+// ── rendering ────────────────────────────────────────────────────────────────────
+/// Wrap the conversation into styled lines for the given inner width.
+fn conversation_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out: Vec<Line> = Vec::new();
+    for m in &app.msgs {
+        let name = name_of(&app.names, &m.from);
+        let color = sender_color(&name);
+        let hhmm = m.ts.get(11..16).unwrap_or("").to_string();
+        let to_disp = if m.to == "all" { "all".to_string() } else { name_of(&app.names, &m.to) };
+        let vmark = match verify_state(m, &app.cfg) {
+            "verified" => Span::styled(" ✓", Style::default().fg(Color::Green)),
+            "FORGED" => Span::styled(" ‼FORGED", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            _ => Span::raw(""),
+        };
+        out.push(Line::from(vec![
+            Span::styled(name, Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  {hhmm}  → {to_disp}"), dim),
+            vmark,
+        ]));
+        for l in crate::wrap(m.subject.trim(), width, "  ") {
+            out.push(Line::from(Span::styled(l, Style::default().add_modifier(Modifier::BOLD))));
+        }
+        let body = m.body.trim();
+        if !body.is_empty() {
+            let shown = if app.full || body.chars().count() <= 600 {
+                body.to_string()
+            } else {
+                format!("{}…", body.chars().take(600).collect::<String>())
+            };
+            for l in crate::wrap(&shown, width, "  ") {
+                out.push(Line::from(Span::raw(l)));
+            }
+            if !app.full && body.chars().count() > 600 {
+                out.push(Line::from(Span::styled("  … Ctrl-F for the full message", dim)));
+            }
+        }
+        out.push(Line::from(""));
+    }
+    out
+}
+
+fn render(f: &mut Frame, app: &mut App) {
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(7), Constraint::Length(1)])
+        .split(f.area());
+
+    // ── top bar: room · presence · sync ──
+    let mut top: Vec<Span> = vec![
+        Span::styled(format!(" mesh #{} ", app.room_label), Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw("  "),
+    ];
+    let mut present_names: Vec<String> = app.present.iter().map(|id| name_of(&app.names, id)).collect();
+    present_names.sort();
+    present_names.dedup();
+    top.push(Span::styled(format!("● {} here", present_names.len()), Style::default().fg(Color::Green)));
+    top.push(Span::styled(format!("  {}", present_names.join(" · ")), dim));
+    f.render_widget(Paragraph::new(Line::from(top)), chunks[0]);
+
+    // ── conversation ──
+    let inner_w = chunks[1].width.saturating_sub(2).max(8) as usize;
+    let inner_h = chunks[1].height.saturating_sub(2).max(1) as usize;
+    let lines = conversation_lines(app, inner_w);
+    let total = lines.len();
+    let max_scroll = total.saturating_sub(inner_h);
+    if app.scroll > max_scroll {
+        app.scroll = max_scroll;
+    }
+    let offset = total.saturating_sub(inner_h).saturating_sub(app.scroll);
+    let pos = if max_scroll == 0 { "".to_string() } else { format!(" ↑{}/{} ", app.scroll, max_scroll) };
+    let title = format!(" conversation {}{}", if app.full { "· full " } else { "" }, pos);
+    f.render_widget(
+        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)).scroll((offset as u16, 0)),
+        chunks[1],
+    );
+
+    // ── compose ──
+    let ct = Line::from(vec![
+        Span::raw(" compose "),
+        Span::styled(format!("→ {}", app.to_label), Style::default().fg(Color::Yellow)),
+        Span::raw(" "),
+    ]);
+    let compose = Block::default().borders(Borders::ALL).title(ct);
+    let carea = compose.inner(chunks[2]);
+    f.render_widget(compose, chunks[2]);
+    let crows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(carea);
+    let subj_focus = app.focus == Focus::Subject;
+    let sp = if subj_focus { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { dim };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![Span::styled("Subj ", sp), Span::raw(app.subject.clone())])),
+        crows[0],
+    );
+    let bp = if !subj_focus { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { dim };
+    let body_para = Paragraph::new(vec![Line::from(vec![Span::styled("› ", bp), Span::raw(app.body.clone())])])
+        .wrap(ratatui::widgets::Wrap { trim: false });
+    f.render_widget(body_para, crows[1]);
+
+    // ── help / status ──
+    let help = if app.picker.is_some() {
+        "↑/↓ pick · Enter choose · Esc cancel".to_string()
+    } else {
+        format!("Tab fields · @ session · Ctrl-F full · Ctrl-R sync · PgUp/Dn · Enter send · Ctrl-C quit   {}", app.status)
+    };
+    f.render_widget(Paragraph::new(Span::styled(help, Style::default().fg(Color::Green))), chunks[3]);
+
+    // ── @-picker overlay ──
+    if let Some(sel) = app.picker {
+        let mut opts = vec!["everyone".to_string()];
+        let mut pn: Vec<String> = app.present.iter().map(|id| name_of(&app.names, id)).collect();
+        pn.sort();
+        pn.dedup();
+        opts.extend(pn);
+        let h = (opts.len() as u16 + 2).min(10);
+        let w = 30u16.min(f.area().width);
+        let area = Rect { x: chunks[2].x + 1, y: chunks[2].y.saturating_sub(h), width: w, height: h };
+        let items: Vec<ListItem> = opts.iter().enumerate().map(|(i, o)| {
+            let st = if i == sel { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default() };
+            ListItem::new(Line::from(Span::styled(format!(" @{o} "), st)))
+        }).collect();
+        f.render_widget(Clear, area);
+        f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(" address → ")), area);
     }
 }
 
-fn install_panic_hook() {
-    let prev = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        let _ = execute!(stdout(), Show, DisableBracketedPaste, LeaveAlternateScreen);
-        let _ = disable_raw_mode();
-        prev(info);
-    }));
-}
-
-/// Background git sync: a request on the channel triggers one pull. Extra requests
-/// that pile up while a pull is in flight collapse into a single follow-up pull.
+// ── terminal lifecycle ──────────────────────────────────────────────────────────
 fn spawn_sync(cfg: Config) -> mpsc::Sender<()> {
     let (tx, rx) = mpsc::channel::<()>();
     thread::spawn(move || {
         while rx.recv().is_ok() {
-            while rx.try_recv().is_ok() {} // coalesce
+            while rx.try_recv().is_ok() {}
             let _ = crate::git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
         }
     });
     tx
 }
 
-struct View {
-    full: bool,
-    verbose: bool,
-    scroll: usize, // lines scrolled up from the bottom; 0 = pinned to latest
-    subject: String,
-    input: String, // the message body
-    subject_focus: bool, // Tab toggles: true = typing the subject, false = the body
-    status: String,
-    room: Option<String>,
-    pane_h: usize, // last drawn message-pane height, for PageUp/PageDown
-}
-
-fn load_msgs(cfg: &Config, room: &Option<String>) -> Vec<Message> {
-    let want: Vec<String> = room.clone().map(|r| vec![r]).unwrap_or_else(|| cfg.rooms.clone());
-    all_messages(cfg).into_iter().filter(|m| want.contains(&m.room)).collect()
-}
-
-/// Wrap every message into printable (already-ANSI-coloured) lines for the pane.
-fn build_lines(cfg: &Config, msgs: &[Message], width: usize, view: &View) -> Vec<String> {
-    let (cs, cd, rst) = ("\x1b[1m", "\x1b[2m", "\x1b[0m");
-    let mut out = Vec::new();
-    for m in msgs {
-        let sc = sender_color(&m.from);
-        let hhmm = m.ts.get(11..16).unwrap_or("");
-        let vmark = match verify_state(m, cfg) {
-            "verified" => " \x1b[32m✓\x1b[0m",
-            "FORGED" => " \x1b[1;31m‼FORGED\x1b[0m",
-            _ => "",
-        };
-        let mut head = format!("{sc}{}{rst} {cd}{} · {} → {}{rst}{}", m.from, hhmm, m.room, m.to, vmark);
-        if view.verbose {
-            head.push_str(&format!(" {cd}[{} · {}]{rst}", m.kind, &m.id[..m.id.len().min(8)]));
-        }
-        out.push(head); // header text is short; sender name is the only long field
-        for l in crate::wrap(m.subject.trim(), width, "  ") {
-            out.push(format!("{cs}{l}{rst}"));
-        }
-        if view.verbose {
-            if let Some(r) = &m.reference {
-                out.push(format!("{cd}  ↩ re {}{rst}", &r[..r.len().min(8)]));
-            }
-        }
-        let body = m.body.trim();
-        if !body.is_empty() {
-            let shown = if view.full || body.chars().count() <= 400 {
-                body.to_string()
-            } else {
-                format!("{}…", body.chars().take(400).collect::<String>())
-            };
-            for l in crate::wrap(&shown, width, "  ") {
-                out.push(l);
-            }
-            if !view.full && body.chars().count() > 400 {
-                out.push(format!("{cd}  … Ctrl-F for the full message{rst}"));
-            }
-        }
-        out.push(String::new());
-    }
-    out
-}
-
-/// Render one compose field to a single visible line: newlines shown as ⏎ (a
-/// pasted multi-line body stays on one line), and if it's longer than `avail`
-/// columns, show the tail (so the cursor end stays visible). Returns the display
-/// string and the cursor column offset within the field.
-fn field_line(text: &str, avail: usize) -> (String, usize) {
-    let disp: String = text.replace(['\n', '\r'], "⏎");
-    let n = disp.chars().count();
-    if n <= avail {
-        (disp, n)
-    } else {
-        let tail: String = disp.chars().skip(n - avail.saturating_sub(1)).collect();
-        (format!("…{tail}"), avail) // cursor sits at the right edge
-    }
-}
-
-fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &str) -> Result<()> {
-    let mut o = stdout();
-    let pane_h = rows.saturating_sub(4).max(1) as usize; // reserve: separator + status + subject + body
-    view.pane_h = pane_h;
-    let total = lines.len();
-    let max_scroll = total.saturating_sub(pane_h);
-    if view.scroll > max_scroll {
-        view.scroll = max_scroll;
-    }
-    let start = total.saturating_sub(pane_h).saturating_sub(view.scroll);
-    let end = (start + pane_h).min(total);
-
-    queue!(o, Clear(ClearType::All))?;
-    for (row, line) in lines[start..end].iter().enumerate() {
-        queue!(o, MoveTo(0, row as u16), Print(line))?;
-    }
-    let sep = rows.saturating_sub(4);
-    let mode = format!(
-        "{}{}",
-        if view.full { "FULL " } else { "" },
-        if view.verbose { "VERBOSE " } else { "" },
-    );
-    let scrolled = if view.scroll > 0 { format!("↑{} ", view.scroll) } else { String::new() };
-    queue!(o, MoveTo(0, sep), Print(format!("\x1b[2m{}\x1b[0m", "─".repeat(cols as usize))))?;
-    queue!(
-        o,
-        MoveTo(0, sep + 1),
-        Clear(ClearType::CurrentLine),
-        Print(format!(
-            "\x1b[2m[{room_label}] {mode}{scrolled}· Tab subj/msg · Ctrl-F full · Ctrl-V verbose · Ctrl-R sync · Ctrl-C quit\x1b[0m",
-        )),
-    )?;
-    if !view.status.is_empty() {
-        queue!(o, Print(format!("  \x1b[32m{}\x1b[0m", view.status)))?;
-    }
-    // Two-field compose: subject on one line, body on the next. Tab moves focus;
-    // the focused prompt lights up and the cursor rests in that field.
-    let (subj_p, body_p) = if view.subject_focus {
-        ("\x1b[1;33mSubj›\x1b[0m ", "\x1b[2m›\x1b[0m ")
-    } else {
-        ("\x1b[2mSubj›\x1b[0m ", "\x1b[1;36m›\x1b[0m ")
-    };
-    let (subj_disp, subj_cur) = field_line(&view.subject, (cols as usize).saturating_sub(6));
-    let (body_disp, body_cur) = field_line(&view.input, (cols as usize).saturating_sub(2));
-    queue!(o, MoveTo(0, sep + 2), Clear(ClearType::CurrentLine), Print(format!("{subj_p}{subj_disp}")))?;
-    queue!(o, MoveTo(0, sep + 3), Clear(ClearType::CurrentLine), Print(format!("{body_p}{body_disp}")))?;
-    // Park the cursor in whichever field has focus (prompt widths: "Subj› " = 6, "› " = 2).
-    let (crow, base, cur) = if view.subject_focus { (sep + 2, 6u16, subj_cur) } else { (sep + 3, 2u16, body_cur) };
-    let col = (base + cur as u16).min(cols.saturating_sub(1));
-    queue!(o, MoveTo(col, crow), Show)?;
-    o.flush()?;
-    Ok(())
-}
-
 pub fn run(room: Option<String>, full: bool) -> Result<()> {
     let cfg = load_config()?;
-    install_panic_hook();
-    let _guard = TermGuard::enter()?;
+    let mut terminal = ratatui::init(); // raw mode + alt screen + panic-restore hook
+    let _ = execute!(stdout(), EnableBracketedPaste);
     let sync_tx = spawn_sync(cfg.clone());
-    let _ = sync_tx.send(()); // pull once on open
+    let _ = sync_tx.send(());
 
-    let post_room = room
-        .clone()
-        .unwrap_or_else(|| cfg.rooms.first().cloned().unwrap_or_else(|| "main".into()));
     let room_label = room.clone().unwrap_or_else(|| cfg.rooms.join(","));
+    let mut app = App {
+        cfg,
+        room,
+        room_label,
+        msgs: Vec::new(),
+        present: Vec::new(),
+        names: HashMap::new(),
+        scroll: 0,
+        full,
+        subject: String::new(),
+        body: String::new(),
+        focus: Focus::Body,
+        to: "all".into(),
+        to_label: "everyone".into(),
+        picker: None,
+        status: String::new(),
+    };
+    app.refresh();
 
-    let mut view = View { full, verbose: false, scroll: 0, subject: String::new(), input: String::new(), subject_focus: false, status: String::new(), room, pane_h: 1 };
-    let mut msgs = load_msgs(&cfg, &view.room);
+    let res = event_loop(&mut terminal, &mut app, &sync_tx);
+    let _ = execute!(stdout(), DisableBracketedPaste);
+    ratatui::restore();
+    res
+}
+
+fn event_loop(
+    terminal: &mut ratatui::DefaultTerminal,
+    app: &mut App,
+    sync_tx: &mpsc::Sender<()>,
+) -> Result<()> {
     let mut last_refresh = Instant::now();
     let mut last_sync = Instant::now();
     let mut dirty = true;
-
     loop {
         if last_refresh.elapsed() >= Duration::from_millis(600) {
-            let fresh = load_msgs(&cfg, &view.room);
-            let changed = fresh.len() != msgs.len()
-                || fresh.last().map(|m| &m.id) != msgs.last().map(|m| &m.id);
-            if changed {
-                msgs = fresh;
+            let before = (app.msgs.len(), app.msgs.last().map(|m| m.id.clone()), app.present.len());
+            app.refresh();
+            if before != (app.msgs.len(), app.msgs.last().map(|m| m.id.clone()), app.present.len()) {
                 dirty = true;
             }
             last_refresh = Instant::now();
@@ -235,80 +365,97 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
                 last_sync = Instant::now();
             }
         }
-
         if dirty {
-            let (cols, rows) = terminal::size().unwrap_or((80, 24));
-            let width = (cols as usize).saturating_sub(1).clamp(24, 300);
-            let lines = build_lines(&cfg, &msgs, width, &view);
-            draw(&lines, &mut view, cols, rows, &room_label)?;
+            terminal.draw(|f| render(f, app))?;
             dirty = false;
         }
-
-        if event::poll(Duration::from_millis(150))? {
-            match event::read()? {
-                Event::Paste(text) => {
-                    // The whole paste (newlines and all) enters the focused field as one
-                    // chunk — never a run of Enters — so multi-line pastes stop firing a
-                    // send per line. Subject is single-line, so flatten newlines there.
-                    if view.subject_focus {
-                        view.subject.push_str(&text.replace(['\n', '\r'], " "));
-                    } else {
-                        view.input.push_str(&text);
-                    }
-                    dirty = true;
-                }
-                Event::Key(k) => {
-                if !matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
-                    continue;
-                }
-                let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                view.status.clear();
-                match k.code {
-                    KeyCode::Char('c') | KeyCode::Char('q') if ctrl => break,
-                    KeyCode::Char('f') if ctrl => view.full = !view.full,
-                    KeyCode::F(2) => view.full = !view.full,
-                    KeyCode::Char('v') if ctrl => view.verbose = !view.verbose,
-                    KeyCode::F(3) => view.verbose = !view.verbose,
-                    KeyCode::Char('r') if ctrl => {
-                        let _ = sync_tx.send(());
-                        last_sync = Instant::now();
-                        view.status = "syncing…".into();
-                    }
-                    KeyCode::PageUp => view.scroll = view.scroll.saturating_add(view.pane_h / 2 + 1),
-                    KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(view.pane_h / 2 + 1),
-                    KeyCode::Home => view.scroll = usize::MAX / 2,
-                    KeyCode::End => view.scroll = 0,
-                    KeyCode::Tab | KeyCode::BackTab => view.subject_focus = !view.subject_focus,
-                    KeyCode::Enter => {
-                        let subject = view.subject.trim().to_string();
-                        let body = view.input.trim().to_string();
-                        if !body.is_empty() || !subject.is_empty() {
-                            match send_from_monitor(&cfg, "all", &post_room, &subject, &body) {
-                                Ok(pushed) => {
-                                    view.status = if pushed { "sent ✓".into() } else { "sent (local — will sync)".into() };
-                                    view.subject.clear();
-                                    view.input.clear();
-                                    view.subject_focus = false;
-                                    view.scroll = 0;
-                                    msgs = load_msgs(&cfg, &view.room); // show our own line immediately
-                                }
-                                Err(e) => view.status = format!("send failed: {e}"),
-                            }
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        if view.subject_focus { view.subject.pop(); } else { view.input.pop(); }
-                    }
-                    KeyCode::Char(c) if !ctrl => {
-                        if view.subject_focus { view.subject.push(c); } else { view.input.push(c); }
-                    }
-                    _ => {}
+        if !event::poll(Duration::from_millis(150))? {
+            continue;
+        }
+        match event::read()? {
+            Event::Paste(text) => {
+                app.insert(&text);
+                dirty = true;
+            }
+            Event::Resize(_, _) => dirty = true,
+            Event::Key(k) if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                if handle_key(app, k.code, k.modifiers, sync_tx, &mut last_sync) {
+                    break;
                 }
                 dirty = true;
-                }
-                _ => dirty = true, // resize / focus / other — just repaint
             }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// Returns true to quit.
+fn handle_key(
+    app: &mut App,
+    code: KeyCode,
+    mods: KeyModifiers,
+    sync_tx: &mpsc::Sender<()>,
+    last_sync: &mut Instant,
+) -> bool {
+    let ctrl = mods.contains(KeyModifiers::CONTROL);
+    // ── @-picker mode ──
+    if let Some(sel) = app.picker {
+        let mut opts = vec!["all".to_string()];
+        let mut present = app.present.clone();
+        present.sort();
+        present.dedup();
+        opts.extend(present); // opts[0]="all", rest = ids
+        match code {
+            KeyCode::Up => app.picker = Some(sel.saturating_sub(1)),
+            KeyCode::Down => app.picker = Some((sel + 1).min(opts.len().saturating_sub(1))),
+            KeyCode::Esc => app.picker = None,
+            KeyCode::Enter => {
+                app.to = opts.get(sel).cloned().unwrap_or_else(|| "all".into());
+                app.to_label = if app.to == "all" { "everyone".into() } else { name_of(&app.names, &app.to) };
+                app.picker = None;
+            }
+            _ => {}
+        }
+        return false;
+    }
+    app.status.clear();
+    match code {
+        KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return true,
+        KeyCode::Char('f') if ctrl => app.full = !app.full,
+        KeyCode::Char('r') if ctrl => {
+            let _ = sync_tx.send(());
+            *last_sync = Instant::now();
+            app.status = "syncing…".into();
+        }
+        KeyCode::Char('@') => app.picker = Some(0),
+        KeyCode::Tab | KeyCode::BackTab => app.focus = if app.focus == Focus::Subject { Focus::Body } else { Focus::Subject },
+        KeyCode::PageUp => app.scroll = app.scroll.saturating_add(8),
+        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(8),
+        KeyCode::Up => app.scroll = app.scroll.saturating_add(1),
+        KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
+        KeyCode::Home => app.scroll = usize::MAX / 2,
+        KeyCode::End => app.scroll = 0,
+        KeyCode::Enter => {
+            let subject = app.subject.trim().to_string();
+            let body = app.body.trim().to_string();
+            if !subject.is_empty() || !body.is_empty() {
+                let room = app.room.clone().unwrap_or_else(|| app.cfg.rooms.first().cloned().unwrap_or_else(|| "main".into()));
+                match send_from_monitor(&app.cfg, &app.to, &room, &subject, &body) {
+                    Ok(pushed) => {
+                        app.status = if pushed { "sent ✓".into() } else { "sent (will sync)".into() };
+                        app.subject.clear();
+                        app.body.clear();
+                        app.scroll = 0;
+                        app.refresh();
+                    }
+                    Err(e) => app.status = format!("send failed: {e}"),
+                }
+            }
+        }
+        KeyCode::Backspace => app.backspace(),
+        KeyCode::Char(c) if !ctrl => app.insert(&c.to_string()),
+        _ => {}
+    }
+    false
 }
