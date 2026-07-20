@@ -168,6 +168,19 @@ impl App {
             Focus::Body => { self.body.pop(); }
         }
     }
+    /// The @-picker's rows as (target_id, display_label), in ONE canonical order so
+    /// the renderer and the key handler agree — otherwise the highlighted row could
+    /// map to a different recipient. Row 0 is always broadcast ("all").
+    fn picker_targets(&self) -> Vec<(String, String)> {
+        let mut ids: Vec<String> = self.present.clone();
+        ids.sort();
+        ids.dedup();
+        let mut rest: Vec<(String, String)> = ids.iter().map(|id| (id.clone(), name_of(&self.names, id))).collect();
+        rest.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        let mut v = vec![("all".to_string(), "everyone".to_string())];
+        v.extend(rest);
+        v
+    }
 }
 
 // ── rendering ────────────────────────────────────────────────────────────────────
@@ -282,17 +295,13 @@ fn render(f: &mut Frame, app: &mut App) {
 
     // ── @-picker overlay ──
     if let Some(sel) = app.picker {
-        let mut opts = vec!["everyone".to_string()];
-        let mut pn: Vec<String> = app.present.iter().map(|id| name_of(&app.names, id)).collect();
-        pn.sort();
-        pn.dedup();
-        opts.extend(pn);
-        let h = (opts.len() as u16 + 2).min(10);
-        let w = 30u16.min(f.area().width);
+        let targets = app.picker_targets();
+        let h = (targets.len() as u16 + 2).min(12);
+        let w = 32u16.min(f.area().width);
         let area = Rect { x: chunks[2].x + 1, y: chunks[2].y.saturating_sub(h), width: w, height: h };
-        let items: Vec<ListItem> = opts.iter().enumerate().map(|(i, o)| {
+        let items: Vec<ListItem> = targets.iter().enumerate().map(|(i, (_, disp))| {
             let st = if i == sel { Style::default().fg(Color::Black).bg(Color::Cyan) } else { Style::default() };
-            ListItem::new(Line::from(Span::styled(format!(" @{o} "), st)))
+            ListItem::new(Line::from(Span::styled(format!(" @{disp} "), st)))
         }).collect();
         f.render_widget(Clear, area);
         f.render_widget(List::new(items).block(Block::default().borders(Borders::ALL).title(" address → ")), area);
@@ -401,18 +410,16 @@ fn handle_key(
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     // ── @-picker mode ──
     if let Some(sel) = app.picker {
-        let mut opts = vec!["all".to_string()];
-        let mut present = app.present.clone();
-        present.sort();
-        present.dedup();
-        opts.extend(present); // opts[0]="all", rest = ids
+        let targets = app.picker_targets();
         match code {
             KeyCode::Up => app.picker = Some(sel.saturating_sub(1)),
-            KeyCode::Down => app.picker = Some((sel + 1).min(opts.len().saturating_sub(1))),
+            KeyCode::Down => app.picker = Some((sel + 1).min(targets.len().saturating_sub(1))),
             KeyCode::Esc => app.picker = None,
             KeyCode::Enter => {
-                app.to = opts.get(sel).cloned().unwrap_or_else(|| "all".into());
-                app.to_label = if app.to == "all" { "everyone".into() } else { name_of(&app.names, &app.to) };
+                if let Some((id, label)) = targets.get(sel) {
+                    app.to = id.clone();
+                    app.to_label = label.clone();
+                }
                 app.picker = None;
             }
             _ => {}
