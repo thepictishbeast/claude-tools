@@ -73,7 +73,9 @@ struct View {
     full: bool,
     verbose: bool,
     scroll: usize, // lines scrolled up from the bottom; 0 = pinned to latest
-    input: String,
+    subject: String,
+    input: String, // the message body
+    subject_focus: bool, // Tab toggles: true = typing the subject, false = the body
     status: String,
     room: Option<String>,
     pane_h: usize, // last drawn message-pane height, for PageUp/PageDown
@@ -130,7 +132,7 @@ fn build_lines(cfg: &Config, msgs: &[Message], width: usize, view: &View) -> Vec
 
 fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &str) -> Result<()> {
     let mut o = stdout();
-    let pane_h = rows.saturating_sub(3).max(1) as usize; // reserve: separator + status + input
+    let pane_h = rows.saturating_sub(4).max(1) as usize; // reserve: separator + status + subject + body
     view.pane_h = pane_h;
     let total = lines.len();
     let max_scroll = total.saturating_sub(pane_h);
@@ -144,7 +146,7 @@ fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &st
     for (row, line) in lines[start..end].iter().enumerate() {
         queue!(o, MoveTo(0, row as u16), Print(line))?;
     }
-    let sep = rows.saturating_sub(3);
+    let sep = rows.saturating_sub(4);
     let mode = format!(
         "{}{}",
         if view.full { "FULL " } else { "" },
@@ -157,15 +159,25 @@ fn draw(lines: &[String], view: &mut View, cols: u16, rows: u16, room_label: &st
         MoveTo(0, sep + 1),
         Clear(ClearType::CurrentLine),
         Print(format!(
-            "\x1b[2m[{room_label}] {mode}{scrolled}· Ctrl-F full · Ctrl-V verbose · Ctrl-R sync · PgUp/PgDn · Ctrl-C quit\x1b[0m",
+            "\x1b[2m[{room_label}] {mode}{scrolled}· Tab subj/msg · Ctrl-F full · Ctrl-V verbose · Ctrl-R sync · Ctrl-C quit\x1b[0m",
         )),
     )?;
     if !view.status.is_empty() {
         queue!(o, Print(format!("  \x1b[32m{}\x1b[0m", view.status)))?;
     }
-    // input line — cursor rests here so typing feels natural
-    let prompt = "\x1b[1;36m› \x1b[0m";
-    queue!(o, MoveTo(0, sep + 2), Clear(ClearType::CurrentLine), Print(format!("{prompt}{}", view.input)), Show)?;
+    // Two-field compose: subject on one line, body on the next. Tab moves focus;
+    // the focused prompt lights up and the cursor rests in that field.
+    let (subj_p, body_p) = if view.subject_focus {
+        ("\x1b[1;33mSubj›\x1b[0m ", "\x1b[2m›\x1b[0m ")
+    } else {
+        ("\x1b[2mSubj›\x1b[0m ", "\x1b[1;36m›\x1b[0m ")
+    };
+    queue!(o, MoveTo(0, sep + 2), Clear(ClearType::CurrentLine), Print(format!("{subj_p}{}", view.subject)))?;
+    queue!(o, MoveTo(0, sep + 3), Clear(ClearType::CurrentLine), Print(format!("{body_p}{}", view.input)))?;
+    // Park the cursor in whichever field has focus (prompt widths: "Subj› " = 6, "› " = 2).
+    let (crow, base, text) = if view.subject_focus { (sep + 2, 6u16, &view.subject) } else { (sep + 3, 2u16, &view.input) };
+    let col = (base + text.chars().count() as u16).min(cols.saturating_sub(1));
+    queue!(o, MoveTo(col, crow), Show)?;
     o.flush()?;
     Ok(())
 }
@@ -182,7 +194,7 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
         .unwrap_or_else(|| cfg.rooms.first().cloned().unwrap_or_else(|| "main".into()));
     let room_label = room.clone().unwrap_or_else(|| cfg.rooms.join(","));
 
-    let mut view = View { full, verbose: false, scroll: 0, input: String::new(), status: String::new(), room, pane_h: 1 };
+    let mut view = View { full, verbose: false, scroll: 0, subject: String::new(), input: String::new(), subject_focus: false, status: String::new(), room, pane_h: 1 };
     let mut msgs = load_msgs(&cfg, &view.room);
     let mut last_refresh = Instant::now();
     let mut last_sync = Instant::now();
@@ -234,13 +246,17 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
                     KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(view.pane_h / 2 + 1),
                     KeyCode::Home => view.scroll = usize::MAX / 2,
                     KeyCode::End => view.scroll = 0,
+                    KeyCode::Tab | KeyCode::BackTab => view.subject_focus = !view.subject_focus,
                     KeyCode::Enter => {
+                        let subject = view.subject.trim().to_string();
                         let body = view.input.trim().to_string();
-                        if !body.is_empty() {
-                            match send_from_monitor(&cfg, "all", &post_room, &body) {
+                        if !body.is_empty() || !subject.is_empty() {
+                            match send_from_monitor(&cfg, "all", &post_room, &subject, &body) {
                                 Ok(pushed) => {
                                     view.status = if pushed { "sent ✓".into() } else { "sent (local — will sync)".into() };
+                                    view.subject.clear();
                                     view.input.clear();
+                                    view.subject_focus = false;
                                     view.scroll = 0;
                                     msgs = load_msgs(&cfg, &view.room); // show our own line immediately
                                 }
@@ -249,9 +265,11 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
                         }
                     }
                     KeyCode::Backspace => {
-                        view.input.pop();
+                        if view.subject_focus { view.subject.pop(); } else { view.input.pop(); }
                     }
-                    KeyCode::Char(c) if !ctrl => view.input.push(c),
+                    KeyCode::Char(c) if !ctrl => {
+                        if view.subject_focus { view.subject.push(c); } else { view.input.push(c); }
+                    }
                     _ => {}
                 }
                 dirty = true;

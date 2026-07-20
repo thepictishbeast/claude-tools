@@ -633,9 +633,15 @@ fn write_and_push(cfg: &Config, mut m: Message, local: bool) -> Result<bool> {
 /// Post a line typed into the live monitor. If this node is the owner, it's stamped
 /// `authority=owner` (kind=directive) so sessions treat it as Paul's word; otherwise
 /// it posts as a normal `say` from this node — never a session impersonating the owner.
-fn send_from_monitor(cfg: &Config, to: &str, room: &str, body: &str) -> Result<bool> {
+fn send_from_monitor(cfg: &Config, to: &str, room: &str, subject: &str, body: &str) -> Result<bool> {
     let owner = cfg.role == "owner";
-    let subject: String = body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+    // Use the typed subject; if left blank, derive one from the body (same as before).
+    let subject = if subject.trim().is_empty() {
+        let d: String = body.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(60).collect();
+        if d.is_empty() { "(message)".into() } else { d }
+    } else {
+        subject.trim().to_string()
+    };
     let m = Message {
         v: 1,
         id: rand_hex(8),
@@ -644,7 +650,7 @@ fn send_from_monitor(cfg: &Config, to: &str, room: &str, body: &str) -> Result<b
         ts: now_rfc3339(),
         kind: if owner { "directive".into() } else { "say".into() },
         reference: None,
-        subject: if subject.is_empty() { "(message)".into() } else { subject },
+        subject,
         body: body.trim().to_string(),
         repo: None,
         room: room.to_string(),
