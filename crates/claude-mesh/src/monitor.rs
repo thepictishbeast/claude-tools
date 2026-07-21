@@ -138,13 +138,83 @@ struct App {
     scroll: usize, // lines up from the bottom; 0 = pinned to latest
     full: bool,
     subject: String,
+    scur: usize, // cursor (char index) in subject
     body: String,
+    cur: usize,  // cursor (char index) in body
+    body_scroll: usize, // top visual row of the body viewport
+    body_w: usize,      // body wrap width from the last render (for arrow nav)
+    last_total: usize,  // conversation line count at last render (scroll anchoring)
+    quit_armed: bool,   // Ctrl-C once with an unsent draft arms; twice quits
+    post_room: String,  // the room a sent message lands in (shown in compose title)
     focus: Focus,
     to: String,          // recipient id, or "all"
     to_label: String,    // friendly recipient label
     picker: Option<usize>, // Some(selected) when the @-picker is open
     picker_snap: Vec<(String, String)>, // FROZEN target list while the picker is open
     status: String,
+}
+
+fn byte_of(s: &str, ci: usize) -> usize {
+    s.char_indices().nth(ci).map(|(b, _)| b).unwrap_or(s.len())
+}
+
+/// Split `text` into visual rows of at most `width` display columns, honoring hard
+/// newlines. Each row = (start char index, row text). Always at least one row —
+/// this is what lets the compose box grow and the cursor map to a screen cell.
+fn visual_rows(text: &str, width: usize) -> Vec<(usize, String)> {
+    let w = width.max(4);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut row_w = 0usize;
+    let mut row_start = 0usize;
+    let mut idx = 0usize;
+    for c in text.chars() {
+        if c == '\n' {
+            rows.push((row_start, std::mem::take(&mut row)));
+            row_w = 0;
+            idx += 1;
+            row_start = idx;
+            continue;
+        }
+        let cw = crate::ch_w(c);
+        if row_w + cw > w && !row.is_empty() {
+            rows.push((row_start, std::mem::take(&mut row)));
+            row_w = 0;
+            row_start = idx;
+        }
+        row.push(c);
+        row_w += cw;
+        idx += 1;
+    }
+    rows.push((row_start, row));
+    rows
+}
+
+/// (visual row, display column) of char-cursor `cur` within `rows`.
+fn cursor_rc(rows: &[(usize, String)], cur: usize) -> (usize, usize) {
+    for (i, (start, s)) in rows.iter().enumerate() {
+        let len = s.chars().count();
+        let end = start + len;
+        if cur < *start {
+            continue;
+        }
+        if cur <= end {
+            // On a soft wrap the next row starts exactly at `end`; the cursor
+            // belongs at that row's column 0, not past this row's edge.
+            if cur == end {
+                if let Some((ns, _)) = rows.get(i + 1) {
+                    if *ns == end {
+                        continue;
+                    }
+                }
+            }
+            let col: usize = s.chars().take(cur - start).map(crate::ch_w).sum();
+            return (i, col);
+        }
+    }
+    let last = rows.len().saturating_sub(1);
+    let col = rows.last().map(|(_, s)| crate::str_w(s)).unwrap_or(0);
+    (last, col)
 }
 
 impl App {
@@ -159,14 +229,95 @@ impl App {
     }
     fn insert(&mut self, s: &str) {
         match self.focus {
-            Focus::Subject => self.subject.push_str(&s.replace(['\n', '\r'], " ")),
-            Focus::Body => self.body.push_str(s),
+            Focus::Subject => {
+                let t = s.replace(['\n', '\r'], " "); // subject stays single-line
+                let b = byte_of(&self.subject, self.scur);
+                self.subject.insert_str(b, &t);
+                self.scur += t.chars().count();
+            }
+            Focus::Body => {
+                let t = s.replace('\r', "");
+                let b = byte_of(&self.body, self.cur);
+                self.body.insert_str(b, &t);
+                self.cur += t.chars().count();
+            }
         }
     }
     fn backspace(&mut self) {
         match self.focus {
-            Focus::Subject => { self.subject.pop(); }
-            Focus::Body => { self.body.pop(); }
+            Focus::Subject => {
+                if self.scur > 0 {
+                    let (b0, b1) = (byte_of(&self.subject, self.scur - 1), byte_of(&self.subject, self.scur));
+                    self.subject.replace_range(b0..b1, "");
+                    self.scur -= 1;
+                }
+            }
+            Focus::Body => {
+                if self.cur > 0 {
+                    let (b0, b1) = (byte_of(&self.body, self.cur - 1), byte_of(&self.body, self.cur));
+                    self.body.replace_range(b0..b1, "");
+                    self.cur -= 1;
+                }
+            }
+        }
+    }
+    fn delete_at(&mut self) {
+        match self.focus {
+            Focus::Subject => {
+                if self.scur < self.subject.chars().count() {
+                    let (b0, b1) = (byte_of(&self.subject, self.scur), byte_of(&self.subject, self.scur + 1));
+                    self.subject.replace_range(b0..b1, "");
+                }
+            }
+            Focus::Body => {
+                if self.cur < self.body.chars().count() {
+                    let (b0, b1) = (byte_of(&self.body, self.cur), byte_of(&self.body, self.cur + 1));
+                    self.body.replace_range(b0..b1, "");
+                }
+            }
+        }
+    }
+    fn move_left(&mut self) {
+        match self.focus {
+            Focus::Subject => self.scur = self.scur.saturating_sub(1),
+            Focus::Body => self.cur = self.cur.saturating_sub(1),
+        }
+    }
+    fn move_right(&mut self) {
+        match self.focus {
+            Focus::Subject => self.scur = (self.scur + 1).min(self.subject.chars().count()),
+            Focus::Body => self.cur = (self.cur + 1).min(self.body.chars().count()),
+        }
+    }
+    /// Up/Down within the body's wrapped rows. Returns false when moving up from
+    /// row 0 (caller shifts focus to the subject line).
+    fn move_vert(&mut self, down: bool) -> bool {
+        let rows = visual_rows(&self.body, self.body_w);
+        let (r, _) = cursor_rc(&rows, self.cur);
+        let colc = self.cur.saturating_sub(rows[r].0); // column in chars
+        if down {
+            if r + 1 < rows.len() {
+                let (ns, s) = &rows[r + 1];
+                self.cur = ns + colc.min(s.chars().count());
+            }
+            true
+        } else if r == 0 {
+            false
+        } else {
+            let (ps, s) = &rows[r - 1];
+            self.cur = ps + colc.min(s.chars().count());
+            true
+        }
+    }
+    fn home_end(&mut self, end: bool) {
+        match self.focus {
+            Focus::Subject => self.scur = if end { self.subject.chars().count() } else { 0 },
+            Focus::Body => {
+                let rows = visual_rows(&self.body, self.body_w);
+                let (r, _) = cursor_rc(&rows, self.cur);
+                let (start, s) = &rows[r];
+                self.cur = if end { start + s.chars().count() } else { *start };
+            }
         }
     }
     /// The @-picker's rows as (target_id, display_label), in ONE canonical order so
@@ -228,9 +379,17 @@ fn conversation_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 
 fn render(f: &mut Frame, app: &mut App) {
     let dim = Style::default().add_modifier(Modifier::DIM);
+    // Compose height GROWS with the body (up to a third of the screen) so long or
+    // pasted text never runs out of sight below the box.
+    let area_w = f.area().width as usize;
+    app.body_w = area_w.saturating_sub(4).max(4); // borders (2) + "› " prefix (2)
+    let rows = visual_rows(&app.body, app.body_w);
+    let max_body = ((f.area().height as usize) / 3).max(3);
+    let body_h = rows.len().clamp(1, max_body);
+    let compose_h = (body_h + 3) as u16; // + subject line + 2 border rows
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(7), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(3), Constraint::Length(compose_h), Constraint::Length(1)])
         .split(f.area());
 
     // ── top bar: room · presence · sync ──
@@ -250,6 +409,12 @@ fn render(f: &mut Frame, app: &mut App) {
     let inner_h = chunks[1].height.saturating_sub(2).max(1) as usize;
     let lines = conversation_lines(app, inner_w);
     let total = lines.len();
+    // Anchor while reading: if scrolled up and new lines appended, grow scroll by
+    // the same amount so the text doesn't slide out from under the reader.
+    if app.scroll > 0 && app.last_total > 0 && total > app.last_total {
+        app.scroll += total - app.last_total;
+    }
+    app.last_total = total;
     let max_scroll = total.saturating_sub(inner_h);
     if app.scroll > max_scroll {
         app.scroll = max_scroll;
@@ -258,15 +423,17 @@ fn render(f: &mut Frame, app: &mut App) {
     let pos = if max_scroll == 0 { "".to_string() } else { format!(" ↑{}/{} ", app.scroll, max_scroll) };
     let title = format!(" conversation {}{}", if app.full { "· full " } else { "" }, pos);
     f.render_widget(
-        Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(title)).scroll((offset as u16, 0)),
+        Paragraph::new(lines)
+            .block(Block::default().borders(Borders::ALL).title(title))
+            .scroll((offset.min(u16::MAX as usize) as u16, 0)),
         chunks[1],
     );
 
-    // ── compose ──
+    // ── compose (multi-line editor with a real cursor) ──
     let ct = Line::from(vec![
         Span::raw(" compose "),
         Span::styled(format!("→ {}", app.to_label), Style::default().fg(Color::Yellow)),
-        Span::raw(" "),
+        Span::styled(format!(" in #{} ", app.post_room), dim), // where a send LANDS
     ]);
     let compose = Block::default().borders(Borders::ALL).title(ct);
     let carea = compose.inner(chunks[2]);
@@ -282,15 +449,54 @@ fn render(f: &mut Frame, app: &mut App) {
         crows[0],
     );
     let bp = if !subj_focus { Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD) } else { dim };
-    let body_para = Paragraph::new(vec![Line::from(vec![Span::styled("› ", bp), Span::raw(app.body.clone())])])
-        .wrap(ratatui::widgets::Wrap { trim: false });
-    f.render_widget(body_para, crows[1]);
+    // Body viewport: keep the cursor's row visible; rows beyond the box scroll.
+    let (crow_i, ccol) = cursor_rc(&rows, app.cur);
+    let view_h = crows[1].height.max(1) as usize;
+    if crow_i < app.body_scroll {
+        app.body_scroll = crow_i;
+    }
+    if crow_i >= app.body_scroll + view_h {
+        app.body_scroll = crow_i + 1 - view_h;
+    }
+    let blines: Vec<Line> = rows
+        .iter()
+        .enumerate()
+        .skip(app.body_scroll)
+        .take(view_h)
+        .map(|(i, (_, s))| {
+            let prefix = if i == 0 { Span::styled("› ", bp) } else { Span::styled("  ", dim) };
+            Line::from(vec![prefix, Span::raw(s.clone())])
+        })
+        .collect();
+    f.render_widget(Paragraph::new(blines), crows[1]);
+    // Show the REAL terminal cursor in the focused field so you always know
+    // where the next character lands.
+    if app.picker.is_none() {
+        let right_edge = carea.x + carea.width.saturating_sub(1);
+        match app.focus {
+            Focus::Body => {
+                let y = crows[1].y + (crow_i - app.body_scroll) as u16;
+                let x = crows[1].x + 2 + ccol.min(u16::MAX as usize) as u16;
+                f.set_cursor_position(ratatui::layout::Position::new(x.min(right_edge), y));
+            }
+            Focus::Subject => {
+                let sw: usize = app.subject.chars().take(app.scur).map(crate::ch_w).sum();
+                let x = crows[0].x + 5 + sw.min(u16::MAX as usize) as u16;
+                f.set_cursor_position(ratatui::layout::Position::new(x.min(right_edge), crows[0].y));
+            }
+        }
+    }
 
     // ── help / status ──
     let help = if app.picker.is_some() {
         "↑/↓ pick · Enter choose · Esc cancel".to_string()
     } else {
-        format!("Tab fields · @/^T address · Ctrl-F full · Ctrl-R sync · PgUp/Dn · Enter send · Ctrl-C quit   {}", app.status)
+        // Status outranks the key list — a warning must never be pushed off-screen.
+        if app.status.is_empty() {
+            "arrows edit · Tab fields · @ address · ^J newline · Enter send · ^F full · PgUp/Dn scroll · ^C quit".to_string()
+        } else {
+            format!("▶ {}", app.status)
+        }
     };
     f.render_widget(Paragraph::new(Span::styled(help, Style::default().fg(Color::Green))), chunks[3]);
 
@@ -325,10 +531,19 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
     let cfg = load_config()?;
     let mut terminal = ratatui::init(); // raw mode + alt screen + panic-restore hook
     let _ = execute!(stdout(), EnableBracketedPaste);
+    // ratatui's panic hook restores raw mode + alt screen, but knows nothing about
+    // bracketed paste — chain a hook so a panic can't leave the shell spewing
+    // ~200~/~201~ around every paste.
+    let prev_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(stdout(), DisableBracketedPaste);
+        prev_hook(info);
+    }));
     let sync_tx = spawn_sync(cfg.clone());
     let _ = sync_tx.send(());
 
     let room_label = room.clone().unwrap_or_else(|| cfg.rooms.join(","));
+    let post_room = room.clone().unwrap_or_else(|| cfg.rooms.first().cloned().unwrap_or_else(|| "main".into()));
     let mut app = App {
         cfg,
         room,
@@ -339,7 +554,14 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
         scroll: 0,
         full,
         subject: String::new(),
+        scur: 0,
         body: String::new(),
+        cur: 0,
+        body_scroll: 0,
+        body_w: 60,
+        last_total: 0,
+        quit_armed: false,
+        post_room,
         focus: Focus::Body,
         to: "all".into(),
         to_label: "everyone".into(),
@@ -429,8 +651,18 @@ fn handle_key(
         return false;
     }
     app.status.clear();
+    let was_armed = app.quit_armed;
+    app.quit_armed = false; // any key other than a second Ctrl-C disarms
     match code {
-        KeyCode::Char('c') | KeyCode::Char('q') if ctrl => return true,
+        KeyCode::Char('c') | KeyCode::Char('q') if ctrl => {
+            // An unsent draft is not destroyed by one reflexive Ctrl-C.
+            if (!app.subject.is_empty() || !app.body.is_empty()) && !was_armed {
+                app.quit_armed = true;
+                app.status = "unsent draft — Ctrl-C again to quit".into();
+            } else {
+                return true;
+            }
+        }
         KeyCode::Char('f') if ctrl => app.full = !app.full,
         KeyCode::Char('r') if ctrl => {
             let _ = sync_tx.send(());
@@ -449,22 +681,45 @@ fn handle_key(
             app.picker = Some(0);
         }
         KeyCode::Tab | KeyCode::BackTab => app.focus = if app.focus == Focus::Subject { Focus::Body } else { Focus::Subject },
+        // Conversation scroll: PgUp/PgDn pages, Ctrl-↑/↓ lines. Plain arrows EDIT.
         KeyCode::PageUp => app.scroll = app.scroll.saturating_add(8),
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(8),
-        KeyCode::Up => app.scroll = app.scroll.saturating_add(1),
-        KeyCode::Down => app.scroll = app.scroll.saturating_sub(1),
-        KeyCode::Home => app.scroll = usize::MAX / 2,
-        KeyCode::End => app.scroll = 0,
+        KeyCode::Up if ctrl => app.scroll = app.scroll.saturating_add(1),
+        KeyCode::Down if ctrl => app.scroll = app.scroll.saturating_sub(1),
+        // Editor navigation — the cursor moves through the text like any editor.
+        KeyCode::Left => app.move_left(),
+        KeyCode::Right => app.move_right(),
+        KeyCode::Up => {
+            // Up from the body's first row hops into the subject line.
+            let leave = app.focus == Focus::Body && !app.move_vert(false);
+            if leave {
+                app.focus = Focus::Subject;
+            }
+        }
+        KeyCode::Down => {
+            if app.focus == Focus::Subject {
+                app.focus = Focus::Body;
+            } else {
+                app.move_vert(true);
+            }
+        }
+        KeyCode::Home => app.home_end(false),
+        KeyCode::End => app.home_end(true),
+        KeyCode::Delete => app.delete_at(),
+        // Ctrl-J = newline in the body (Enter always sends).
+        KeyCode::Char('j') if ctrl && app.focus == Focus::Body => app.insert("\n"),
         KeyCode::Enter => {
             let subject = app.subject.trim().to_string();
             let body = app.body.trim().to_string();
             if !subject.is_empty() || !body.is_empty() {
-                let room = app.room.clone().unwrap_or_else(|| app.cfg.rooms.first().cloned().unwrap_or_else(|| "main".into()));
-                match send_from_monitor(&app.cfg, &app.to, &room, &subject, &body) {
+                match send_from_monitor(&app.cfg, &app.to, &app.post_room.clone(), &subject, &body) {
                     Ok(pushed) => {
                         app.status = if pushed { "sent ✓".into() } else { "sent (will sync)".into() };
                         app.subject.clear();
                         app.body.clear();
+                        app.scur = 0;
+                        app.cur = 0;
+                        app.body_scroll = 0;
                         app.scroll = 0;
                         app.refresh();
                     }

@@ -624,8 +624,14 @@ fn write_and_push(cfg: &Config, mut m: Message, local: bool) -> Result<bool> {
         return Ok(false);
     }
     let rel = format!("bus/{fname}");
-    git(cfg, &["add", &rel])?;
-    commit(cfg, &format!("msg: {}", m.subject))?;
+    // From here the message is durably on disk in BOTH buses — it IS delivered
+    // locally and readable by every same-host session. Git trouble (locked index,
+    // hook, sudo config) must therefore NOT surface as Err: a caller that retried
+    // on "error" would write a SECOND copy. Report "not pushed" instead; the next
+    // `sync`/post/archive sweeps it up.
+    if git(cfg, &["add", &rel]).is_err() || commit(cfg, &format!("msg: {}", m.subject)).is_err() {
+        return Ok(false);
+    }
     let _ = git_ok(cfg, &["pull", "--rebase", "--autostash"]);
     Ok(git_ok(cfg, &["push"]))
 }
@@ -961,9 +967,18 @@ fn cmd_rooms() -> Result<()> {
 }
 /// Word-wrap `text` to `width` columns, indenting each line. Nothing runs off
 /// the right edge — this is what stops messages getting cut off on a small screen.
+/// Display width of one char (emoji/CJK = 2, combining = 0). Wrapping by DISPLAY
+/// width — not char count — is what keeps the right border straight when a
+/// message contains emoji or wide characters.
+fn ch_w(c: char) -> usize {
+    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+}
+fn str_w(s: &str) -> usize {
+    s.chars().map(ch_w).sum()
+}
 fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
     let w = width.max(24);
-    let ind = indent.chars().count();
+    let ind = str_w(indent);
     let avail = w.saturating_sub(ind).max(1); // usable columns after the indent
     let mut out = Vec::new();
     for para in text.split('\n') {
@@ -974,15 +989,29 @@ fn wrap(text: &str, width: usize, indent: &str) -> Vec<String> {
         let mut line = String::from(indent);
         let mut len = ind;
         for word in para.split_whitespace() {
-            // Hard-break any token too long to ever fit a line (hex ids, sigs, URLs —
+            // Hard-break any token too wide to ever fit a line (hex ids, sigs, URLs —
             // which fill the bus). Without this it overflows and gets cut on the right.
-            let pieces: Vec<String> = if word.chars().count() > avail {
-                word.chars().collect::<Vec<_>>().chunks(avail).map(|c| c.iter().collect()).collect()
+            let pieces: Vec<String> = if str_w(word) > avail {
+                let mut ps = Vec::new();
+                let (mut cur, mut cl) = (String::new(), 0usize);
+                for c in word.chars() {
+                    let cw = ch_w(c);
+                    if cl + cw > avail && !cur.is_empty() {
+                        ps.push(std::mem::take(&mut cur));
+                        cl = 0;
+                    }
+                    cur.push(c);
+                    cl += cw;
+                }
+                if !cur.is_empty() {
+                    ps.push(cur);
+                }
+                ps
             } else {
                 vec![word.to_string()]
             };
             for piece in pieces {
-                let pl = piece.chars().count();
+                let pl = str_w(&piece);
                 if len > ind && len + 1 + pl > w {
                     out.push(std::mem::replace(&mut line, String::from(indent)));
                     len = ind;
