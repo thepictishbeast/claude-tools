@@ -143,6 +143,7 @@ struct App {
     to: String,          // recipient id, or "all"
     to_label: String,    // friendly recipient label
     picker: Option<usize>, // Some(selected) when the @-picker is open
+    picker_snap: Vec<(String, String)>, // FROZEN target list while the picker is open
     status: String,
 }
 
@@ -289,13 +290,13 @@ fn render(f: &mut Frame, app: &mut App) {
     let help = if app.picker.is_some() {
         "↑/↓ pick · Enter choose · Esc cancel".to_string()
     } else {
-        format!("Tab fields · @ session · Ctrl-F full · Ctrl-R sync · PgUp/Dn · Enter send · Ctrl-C quit   {}", app.status)
+        format!("Tab fields · @/^T address · Ctrl-F full · Ctrl-R sync · PgUp/Dn · Enter send · Ctrl-C quit   {}", app.status)
     };
     f.render_widget(Paragraph::new(Span::styled(help, Style::default().fg(Color::Green))), chunks[3]);
 
-    // ── @-picker overlay ──
+    // ── @-picker overlay (renders the FROZEN snapshot, not live present) ──
     if let Some(sel) = app.picker {
-        let targets = app.picker_targets();
+        let targets = &app.picker_snap;
         let h = (targets.len() as u16 + 2).min(12);
         let w = 32u16.min(f.area().width);
         let area = Rect { x: chunks[2].x + 1, y: chunks[2].y.saturating_sub(h), width: w, height: h };
@@ -343,6 +344,7 @@ pub fn run(room: Option<String>, full: bool) -> Result<()> {
         to: "all".into(),
         to_label: "everyone".into(),
         picker: None,
+        picker_snap: Vec::new(),
         status: String::new(),
     };
     app.refresh();
@@ -410,7 +412,7 @@ fn handle_key(
     let ctrl = mods.contains(KeyModifiers::CONTROL);
     // ── @-picker mode ──
     if let Some(sel) = app.picker {
-        let targets = app.picker_targets();
+        let targets = app.picker_snap.clone(); // frozen when the picker opened
         match code {
             KeyCode::Up => app.picker = Some(sel.saturating_sub(1)),
             KeyCode::Down => app.picker = Some((sel + 1).min(targets.len().saturating_sub(1))),
@@ -435,7 +437,17 @@ fn handle_key(
             *last_sync = Instant::now();
             app.status = "syncing…".into();
         }
-        KeyCode::Char('@') => app.picker = Some(0),
+        // '@' opens the address picker only when compose is empty (so you pick a
+        // recipient first); once you're typing, '@' is a literal char (paul@host).
+        // Ctrl-T (re)opens the picker any time. Both FREEZE the target list.
+        KeyCode::Char('@') if app.subject.is_empty() && app.body.is_empty() => {
+            app.picker_snap = app.picker_targets();
+            app.picker = Some(0);
+        }
+        KeyCode::Char('t') if ctrl => {
+            app.picker_snap = app.picker_targets();
+            app.picker = Some(0);
+        }
         KeyCode::Tab | KeyCode::BackTab => app.focus = if app.focus == Focus::Subject { Focus::Body } else { Focus::Subject },
         KeyCode::PageUp => app.scroll = app.scroll.saturating_add(8),
         KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(8),
