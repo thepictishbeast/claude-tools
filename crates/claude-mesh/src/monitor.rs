@@ -493,7 +493,7 @@ fn render(f: &mut Frame, app: &mut App) {
     } else {
         // Status outranks the key list — a warning must never be pushed off-screen.
         if app.status.is_empty() {
-            "arrows edit · Tab fields · @ address · ^J newline · Enter send · ^F full · PgUp/Dn scroll · ^C quit".to_string()
+            "arrows edit · Enter newline · ^S SEND · Tab fields · @ address · ^F full · PgUp/Dn scroll · ^C quit".to_string()
         } else {
             format!("▶ {}", app.status)
         }
@@ -706,9 +706,15 @@ fn handle_key(
         KeyCode::Home => app.home_end(false),
         KeyCode::End => app.home_end(true),
         KeyCode::Delete => app.delete_at(),
-        // Ctrl-J = newline in the body (Enter always sends).
-        KeyCode::Char('j') if ctrl && app.focus == Focus::Body => app.insert("\n"),
-        KeyCode::Enter => {
+        // Enter = NEWLINE in the body, like any editor (from the subject it hops
+        // into the body). Sending is EXPLICIT: Ctrl-S. Note a "Ctrl-J newline"
+        // binding is impossible — Ctrl-J and Enter are the same byte (0x0A), so
+        // the previous design submitted when you wanted a new line.
+        KeyCode::Enter => match app.focus {
+            Focus::Subject => app.focus = Focus::Body,
+            Focus::Body => app.insert("\n"),
+        },
+        KeyCode::Char('s') if ctrl => {
             let subject = app.subject.trim().to_string();
             let body = app.body.trim().to_string();
             if !subject.is_empty() || !body.is_empty() {
@@ -732,4 +738,50 @@ fn handle_key(
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{cursor_rc, visual_rows};
+
+    #[test]
+    fn newline_makes_separate_rows() {
+        // The Paul bug class: "first\nsecond" must be TWO rows, never a submit
+        // side-effect or one collapsed line.
+        let rows = visual_rows("first\nsecond", 40);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "first");
+        assert_eq!(rows[1].1, "second");
+        // char indices: "second" starts after "first" + the newline char
+        assert_eq!(rows[1].0, 6);
+    }
+    #[test]
+    fn soft_wrap_splits_and_cursor_lands_on_next_row() {
+        let rows = visual_rows("abcdefgh", 4);
+        assert_eq!(rows.iter().map(|(_, s)| s.as_str()).collect::<Vec<_>>(), ["abcd", "efgh"]);
+        // cursor at char 4 sits at the START of the wrapped row, not past row 0's edge
+        assert_eq!(cursor_rc(&rows, 4), (1, 0));
+        assert_eq!(cursor_rc(&rows, 8), (1, 4)); // end of text
+    }
+    #[test]
+    fn cursor_after_newline_is_next_row_col0() {
+        let rows = visual_rows("ab\ncd", 40);
+        assert_eq!(cursor_rc(&rows, 2), (0, 2)); // before the newline
+        assert_eq!(cursor_rc(&rows, 3), (1, 0)); // after it
+    }
+    #[test]
+    fn wide_chars_wrap_by_display_width() {
+        // 3 CJK chars = 6 columns; at width 4 only two fit per row
+        let rows = visual_rows("中文字", 4);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].1, "中文");
+        // cursor after the first wide char = display column 2
+        assert_eq!(cursor_rc(&rows, 1), (0, 2));
+    }
+    #[test]
+    fn empty_text_still_one_row() {
+        let rows = visual_rows("", 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(cursor_rc(&rows, 0), (0, 0));
+    }
 }
