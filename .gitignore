@@ -7,3 +7,6 @@ crates/*/Cargo.lock
 .DS_Store
 *~
 *.swp
+
+# agent onboarding kept local-only (cruft standard)
+CLAUDE.md
