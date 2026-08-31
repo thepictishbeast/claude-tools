@@ -39,7 +39,7 @@ chmod +x "$T/bin/systemctl"; }
 
 run(){ MAILLOG="$T/mail" PATH="$T/bin:$PATH" LOGWATCH_STATE="$T/state" \
        LOGWATCH_REMIND_SEC="${1:-86400}" bash "$S" >/dev/null 2>&1 || true; }
-mails(){ grep -c '===MAIL===' "$T/mail" 2>/dev/null || echo 0; }
+mails(){ { grep -c '===MAIL===' "$T/mail" 2>/dev/null || true; } | head -1; }
 
 : > "$T/mail"
 
