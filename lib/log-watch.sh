@@ -40,16 +40,58 @@ while read -r mount use; do
   (( use >= 90 )) && issues+=("$mount at ${use}% disk usage")
 done < <(df --output=target,pcent -x tmpfs -x devtmpfs -x overlay 2>/dev/null | tail -n +2)
 
-if ((${#issues[@]})); then
-  {
-    echo "Subject: [log-watch] ${#issues[@]} anomaly(ies) on $(hostname)"
-    echo "To: $NOTIFY"
-    echo ""
-    printf '%s\n\n' "${issues[@]}"
-    echo "-- log-watch, $(date -u +%FT%TZ)"
+# ---------------------------------------------------------------------------
+# Mail on CHANGE, not on state. This ran hourly and mailed whenever any issue
+# existed, so one persistent condition became mail forever: two stale transient
+# `run-*.service` units from a failed `caddy reload` produced 261 identical
+# messages, 43% of the inbox, about a host that was healthy the whole time.
+#
+# Now: alert when the anomaly set changes, remind once a day while it persists
+# so a real problem cannot be silently forgotten, and say so when it clears.
+# ---------------------------------------------------------------------------
+STATE="${LOGWATCH_STATE:-/var/lib/log-watch/state}"
+REMIND_SEC="${LOGWATCH_REMIND_SEC:-86400}"
+mkdir -p "$(dirname "$STATE")" 2>/dev/null || STATE=/tmp/.log-watch-state
+
+send(){ # send <subject> <body>
+  { echo "Subject: $1"; echo "To: $NOTIFY"; echo ""; printf '%s\n' "$2"
+    echo; echo "-- log-watch, $(date -u +%FT%TZ)"
   } | sendmail "$NOTIFY" 2>/dev/null || echo "WARN: sendmail failed" >&2
-  echo "ANOMALIES: ${#issues[@]} (mailed $NOTIFY)"
+}
+
+if ((${#issues[@]})); then
+  body=$(printf '%s\n\n' "${issues[@]}")
+  now_sum=$(printf '%s' "$body" | md5sum | cut -d' ' -f1)
+  prev_sum=$(cut -d' ' -f1 < "$STATE" 2>/dev/null || echo "")
+  prev_at=$(cut -d' ' -f2 < "$STATE" 2>/dev/null || echo 0)
+  age=$(( $(date +%s) - ${prev_at:-0} ))
+
+  if [[ "$now_sum" != "$prev_sum" ]]; then
+    send "[log-watch] ${#issues[@]} anomaly(ies) on $(hostname)" "$body"
+    echo "ANOMALIES: ${#issues[@]} (changed — mailed $NOTIFY)"
+  elif (( age >= REMIND_SEC )); then
+    send "[log-watch] still unresolved after $((age/3600))h on $(hostname)" \
+         "$body
+These are the SAME anomalies as the last alert. Daily reminder only."
+    echo "ANOMALIES: ${#issues[@]} (unchanged ${age}s — daily reminder sent)"
+  else
+    echo "ANOMALIES: ${#issues[@]} (unchanged, already reported — no mail)"
+  fi
+  # refresh the timestamp only when we actually mailed, so the daily reminder
+  # measures time since the last ALERT rather than since the last scan
+  if [[ "$now_sum" != "$prev_sum" ]] || (( age >= REMIND_SEC )); then
+    printf '%s %s\n' "$now_sum" "$(date +%s)" > "$STATE"
+  else
+    printf '%s %s\n' "$now_sum" "${prev_at:-$(date +%s)}" > "$STATE"
+  fi
   printf ' - %s\n' "${issues[@]}" | head -10
   exit 1
+fi
+
+# recovered: tell him once, then go quiet
+if [[ -s "$STATE" ]]; then
+  send "[log-watch] all clear on $(hostname)" "Previously reported anomalies have cleared."
+  : > "$STATE"
+  echo "log-watch: recovered (mailed all-clear)"
 fi
 echo "log-watch: clean ($(date -u +%FT%TZ))"
