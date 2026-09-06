@@ -1,74 +1,72 @@
 #!/usr/bin/env bash
-# One check, one topic, per site — so a phone can subscribe per domain.
+# One check, one ntfy topic, per site — so a phone can subscribe per domain.
 #
 # The other monitors here are organised by concern: cert-watch covers every
 # certificate in one digest, referral-report covers every site in one
 # summary. That is right for those jobs and wrong for this one. If a single
 # site is down you want that site's alert, not a bulletin about the estate,
-# and you want to be able to mute one domain without going deaf to the rest.
+# and you want to mute one domain without going deaf to the rest.
 #
-# So each site gets its own ntfy topic, `plausiden-<slug>`, and this checks
-# the two things that actually take a site off the air:
+# Each host is checked for the two things that actually take a site off the
+# air: it stops answering as expected, or its certificate expires and a
+# browser refuses before anyone notices.
 #
-#   * it stops answering, or answers with the wrong status
-#   * its certificate expires (a browser refuses before you notice)
+# "As expected" is per-host, and that detail is the whole point. Checking
+# "/" for a 2xx would report permanent failure on four healthy hosts here:
+# mta-sts, autoconfig, autodiscover and lk-jwt all 404 at the root by
+# design and serve a specific path. It would also flag dev1 and dev4,
+# where a 401 is the fleet-console gate working — a 200 there would be the
+# emergency. A monitor that fires on healthy services is worse than none,
+# because it trains the reader to ignore it, which is exactly how the DKIM
+# check stayed red for four months without anyone looking.
 #
-# Dedup, the daily reminder and the all-clear all come from notify.sh, so a
-# site that stays down alerts once and then reminds daily rather than every
-# ten minutes.
+# Config: /etc/site-watch.conf, one line of
+#     <host>  <topic-slug>  <path>  <expected-status-regex>
 #
-#   site-watch.sh [--sites "host=slug,..."] [--dry-run]
+#   site-watch.sh [--config FILE] [--dry-run] [--quiet]
 set -uo pipefail
 
-# host=slug. The slug becomes the ntfy topic suffix, so it is what you
-# subscribe to on the phone.
-SITES="${SITE_WATCH_SITES:-\
-plausiden.com=plausiden,\
-prosperityclub.com=prosperityclub,\
-erminewallet.org=erminewallet,\
-william-armstrong.com=william-armstrong,\
-ntfy.plausiden.com=ntfy,\
-cloud.plausiden.com=cloud,\
-matrix.plausiden.com=matrix,\
-vault.plausiden.com=vault}"
-
+CONF="${SITE_WATCH_CONF:-/etc/site-watch.conf}"
 NOTIFY="${SITE_WATCH_NOTIFY:-/home/paul/projects/claude-tools/lib/notify.sh}"
 CERT_WARN_DAYS="${SITE_WATCH_CERT_DAYS:-21}"
 TIMEOUT="${SITE_WATCH_TIMEOUT:-15}"
-DRY=0
+DRY=0; QUIET=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --sites)   SITES="$2"; shift 2 ;;
+    --config)  CONF="$2"; shift 2 ;;
     --dry-run) DRY=1; shift ;;
+    --quiet)   QUIET=1; shift ;;
     *) echo "site-watch: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 
-ok=0; bad=0
-IFS=',' read -ra ENTRIES <<< "$(printf '%s' "$SITES" | tr -d ' \\')"
-for entry in "${ENTRIES[@]}"; do
-  [ -n "$entry" ] || continue
-  host="${entry%%=*}"; slug="${entry##*=}"
-  [ -n "$host" ] && [ -n "$slug" ] || continue
+[ -r "$CONF" ] || { echo "site-watch: cannot read $CONF" >&2; exit 2; }
+
+ok=0; bad=0; checked=0
+while read -r host slug path expect _rest; do
+  case "$host" in ''|\#*) continue ;; esac
+  [ -n "$slug" ] && [ -n "$path" ] && [ -n "$expect" ] || {
+    echo "site-watch: malformed line for '$host' — skipping" >&2; continue; }
+  checked=$((checked+1))
   problems=""
 
-  code=$(curl -s -o /dev/null -w '%{http_code}' -m "$TIMEOUT" "https://$host/" 2>/dev/null)
-  # 2xx and 3xx are both fine: several of these redirect by design
-  # (cloud -> /login, crm -> a session route). Only a 4xx/5xx, or no
-  # answer at all, means the site is actually failing a visitor.
-  case "$code" in
-    2??|3??) : ;;
-    000) problems="${problems}  no response at all (DNS, TLS handshake, or the service is down)"$'\n' ;;
-    *)   problems="${problems}  HTTP $code — the site answered, but not with a page"$'\n' ;;
-  esac
+  code=$(curl -s -o /dev/null -w '%{http_code}' -m "$TIMEOUT" "https://${host}${path}" 2>/dev/null)
+  if [ "$code" = "000" ]; then
+    problems="${problems}  no response at all — DNS, TLS handshake, or the service is down"$'\n'
+  elif ! printf '%s' "$code" | grep -qE "$expect"; then
+    problems="${problems}  HTTP $code at ${path} (expected ${expect})"$'\n'
+  fi
 
-  end=$(echo | timeout "$TIMEOUT" openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null \
+  # Certificate. Checked even when HTTP is fine, because expiry is the
+  # failure you want warning of rather than notice of.
+  end=$(echo | timeout "$TIMEOUT" openssl s_client -connect "${host}:443" -servername "$host" 2>/dev/null \
         | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2)
   if [ -n "$end" ]; then
     end_s=$(date -d "$end" +%s 2>/dev/null || echo 0)
-    days=$(( (end_s - $(date +%s)) / 86400 ))
-    if [ "$end_s" -gt 0 ] && [ "$days" -lt "$CERT_WARN_DAYS" ]; then
-      problems="${problems}  certificate expires in ${days} days — renewal has already missed once"$'\n'
+    if [ "$end_s" -gt 0 ]; then
+      days=$(( (end_s - $(date +%s)) / 86400 ))
+      [ "$days" -lt "$CERT_WARN_DAYS" ] && \
+        problems="${problems}  certificate expires in ${days} days — renewal has already missed at least once"$'\n'
     fi
   elif [ "$code" != "000" ]; then
     problems="${problems}  could not read the TLS certificate"$'\n'
@@ -76,16 +74,17 @@ for entry in "${ENTRIES[@]}"; do
 
   if [ -n "$problems" ]; then
     bad=$((bad+1))
-    printf '  %-28s FAIL\n%s' "$host" "$problems"
+    [ "$QUIET" = 1 ] || printf '  %-28s FAIL\n%s' "$host" "$problems"
     [ "$DRY" = 1 ] || printf '%s' "$problems" | "$NOTIFY" --key "site:$host" \
         --title "$host is failing" --priority high --tags rotating_light \
         --topic "plausiden-$slug" >/dev/null 2>&1
   else
     ok=$((ok+1))
-    printf '  %-28s ok (HTTP %s)\n' "$host" "$code"
+    [ "$QUIET" = 1 ] || printf '  %-28s ok (%s)  -> plausiden-%s\n' "$host" "$code" "$slug"
     [ "$DRY" = 1 ] || "$NOTIFY" --resolve "site:$host" --topic "plausiden-$slug" >/dev/null 2>&1
   fi
-done
+done < "$CONF"
 
-echo "site-watch: $ok ok, $bad failing"
+[ "$checked" -gt 0 ] || { echo "site-watch: no hosts configured in $CONF" >&2; exit 2; }
+echo "site-watch: $ok ok, $bad failing, $checked checked"
 [ "$bad" -eq 0 ]

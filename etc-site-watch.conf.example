@@ -1,0 +1,48 @@
+# site-watch: one line per host. Fields are whitespace-separated.
+#
+#   <host>  <topic-slug>  <path>  <expected-status-regex>
+#
+# The last two fields exist because checking "/" for a 2xx is wrong for
+# several of these, and a monitor that fires on a healthy service is worse
+# than no monitor — it teaches you to ignore it. Every value below was
+# verified against the live host before being written here.
+#
+# The topic is plausiden-<slug>; subscribe to that on the phone.
+
+# ── public sites ─────────────────────────────────────────────────────────
+plausiden.com              plausiden            /        ^2..$
+plausiden.org              plausiden-org        /        ^2..$
+plausiden.online           plausiden-online     /        ^2..$
+prosperityclub.com         prosperityclub       /        ^2..$
+next.prosperityclub.com    prosperityclub-next  /        ^2..$
+erminewallet.org           erminewallet         /        ^2..$
+erminewallet.com           erminewallet-com     /        ^[23]..$
+william-armstrong.com      william-armstrong    /        ^2..$
+
+# ── services ─────────────────────────────────────────────────────────────
+ntfy.plausiden.com         ntfy                 /        ^2..$
+mail.plausiden.com         mail                 /        ^2..$
+matrix.plausiden.com       matrix               /        ^2..$
+vault.plausiden.com        vault                /        ^2..$
+livekit.plausiden.com      livekit              /        ^2..$
+cloud.plausiden.com        cloud                /        ^[23]..$
+auth.plausiden.com         auth                 /        ^[23]..$
+crm.plausiden.com          crm                  /        ^[23]..$
+cms.plausiden.com          cms                  /        ^[23]..$
+analytics.plausiden.com    analytics            /        ^[23]..$
+next.plausiden.com         next                 /        ^[23]..$
+
+# ── auth-gated: 401 IS the healthy answer here ───────────────────────────
+# These sit behind the fleet-console basic auth. A 200 without credentials
+# would mean the gate had fallen off, so 401 is what we want to see.
+dev1.plausiden.com         dev1                 /        ^401$
+dev4.plausiden.com         dev4                 /        ^401$
+dev.plausiden.com          dev                  /        ^2..$
+dev2.plausiden.com         dev2                 /        ^2..$
+
+# ── path-specific: "/" is a 404 by design, the real endpoint is elsewhere ─
+# Checking "/" on these would report a permanent, meaningless failure.
+mta-sts.plausiden.com      mta-sts        /.well-known/mta-sts.txt              ^2..$
+autoconfig.plausiden.com   autoconfig     /mail/config-v1.1.xml                 ^2..$
+autodiscover.plausiden.com autodiscover   /autodiscover/autodiscover.xml        ^2..$
+lk-jwt.plausiden.com       lk-jwt         /healthz                              ^2..$
