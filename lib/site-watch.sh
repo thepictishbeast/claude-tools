@@ -30,12 +30,24 @@ CONF="${SITE_WATCH_CONF:-/etc/site-watch.conf}"
 NOTIFY="${SITE_WATCH_NOTIFY:-/home/paul/projects/claude-tools/lib/notify.sh}"
 CERT_WARN_DAYS="${SITE_WATCH_CERT_DAYS:-21}"
 TIMEOUT="${SITE_WATCH_TIMEOUT:-15}"
-DRY=0; QUIET=0
+DRY=0; QUIET=0; HEARTBEAT=0
 while [ $# -gt 0 ]; do
   case "$1" in
-    --config)  CONF="$2"; shift 2 ;;
-    --dry-run) DRY=1; shift ;;
-    --quiet)   QUIET=1; shift ;;
+    --config)    CONF="$2"; shift 2 ;;
+    --dry-run)   DRY=1; shift ;;
+    --quiet)     QUIET=1; shift ;;
+    # Post an "all ok" to every site's topic even when nothing is wrong.
+    #
+    # Without this a healthy site publishes nothing at all, so its channel
+    # sits empty — and an empty channel is indistinguishable from one that
+    # was never wired up. That is the same failure as a check nobody
+    # notices is red, only inverted: you cannot tell working silence from
+    # broken silence.
+    #
+    # A periodic heartbeat gives silence a meaning. If a topic has said
+    # nothing for longer than the heartbeat interval, the monitor itself
+    # has stopped, and that is worth knowing.
+    --heartbeat) HEARTBEAT=1; shift ;;
     *) echo "site-watch: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -82,6 +94,16 @@ while read -r host slug path expect _rest; do
     ok=$((ok+1))
     [ "$QUIET" = 1 ] || printf '  %-28s ok (%s)  -> plausiden-%s\n' "$host" "$code" "$slug"
     [ "$DRY" = 1 ] || "$NOTIFY" --resolve "site:$host" --topic "plausiden-$slug" >/dev/null 2>&1
+    if [ "$HEARTBEAT" = 1 ] && [ "$DRY" = 0 ]; then
+      # The timestamp is deliberate. notify.sh suppresses an unchanged
+      # message, which is right for alerts and wrong for a heartbeat —
+      # a heartbeat that gets deduplicated into silence is not a
+      # heartbeat. Varying the body makes each one genuinely new.
+      printf 'Healthy at %s — HTTP %s on %s%s\n\nThis is the periodic check-in. If this topic goes quiet for more than a week, the monitor itself has stopped.\n' \
+        "$(date -u '+%Y-%m-%d %H:%M UTC')" "$code" "$host" "$path" \
+        | "$NOTIFY" --key "beat:$host" --title "$host ok" \
+            --priority min --tags heavy_check_mark --topic "plausiden-$slug" >/dev/null 2>&1
+    fi
   fi
 done < "$CONF"
 
