@@ -43,6 +43,16 @@ done
 
 ls "$LOG"* >/dev/null 2>&1 || { echo "referral-report: no log at $LOG" >&2; exit 2; }
 
+# Being unable to READ the log is not the same as there being nothing to
+# report, and the difference matters: the Caddy logs are caddy:caddy 0600,
+# so running this as the wrong user produces a confident, permanent
+# "no referrals" that looks exactly like a quiet week. Fail loudly instead.
+if ! head -c1 "$LOG" >/dev/null 2>&1; then
+  echo "referral-report: $LOG exists but is not readable as $(id -un) —" >&2
+  echo "  refusing to report zero, because that is indistinguishable from real data." >&2
+  exit 2
+fi
+
 report=$(REFERRAL_LOG="$LOG" REFERRAL_DAYS="$DAYS" python3 <<'PY'
 import json, glob, gzip, os, time, collections
 from urllib.parse import urlsplit, parse_qs
