@@ -99,6 +99,12 @@ while read -r host slug path expect _rest; do
       # message, which is right for alerts and wrong for a heartbeat —
       # a heartbeat that gets deduplicated into silence is not a
       # heartbeat. Varying the body makes each one genuinely new.
+      # `low`, not `min`. On Android a min-priority message is not shown
+      # as a notification at all — it lands silently in the app's list,
+      # which is indistinguishable from nothing arriving. That defeats a
+      # check-in whose entire purpose is being visible. `low` shows it
+      # without sound or vibration.
+      #
       # Say what was actually checked and what the answer was, so the
       # check-in carries evidence rather than just the word "ok". A
       # reassurance you cannot verify is worth very little — and if the
@@ -111,7 +117,7 @@ while read -r host slug path expect _rest; do
       printf 'Responding normally.\n\n  checked   https://%s%s\n  answered  HTTP %s\n  TLS       %s\n  at        %s\n\nThis is the weekly check-in, not an alert. It means the monitor itself is alive: if this topic goes quiet for more than a week, something has stopped watching.\n' \
         "$host" "$path" "$code" "$cert_line" "$(date -u '+%a %d %b, %H:%M UTC')" \
         | "$NOTIFY" --key "beat:$host" --title "$host — all good" \
-            --priority min --tags heavy_check_mark --topic "plausiden-$slug" >/dev/null 2>&1
+            --priority low --tags heavy_check_mark --topic "plausiden-$slug" >/dev/null 2>&1
     fi
   fi
 done < "$CONF"
