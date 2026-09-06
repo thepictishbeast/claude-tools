@@ -719,8 +719,14 @@ fn handle_key(
             let body = app.body.trim().to_string();
             if !subject.is_empty() || !body.is_empty() {
                 match send_from_monitor(&app.cfg, &app.to, &app.post_room.clone(), &subject, &body) {
-                    Ok(pushed) => {
-                        app.status = if pushed { "sent ✓".into() } else { "sent (will sync)".into() };
+                    Ok(delivery) => {
+                        // never show a bare ✓ for a message that only hit disk —
+                        // the compose line must not overstate delivery either
+                        app.status = match delivery {
+                            crate::Delivery::Pushed => "sent ✓".into(),
+                            crate::Delivery::Committed => "sent (will sync)".into(),
+                            crate::Delivery::OnDiskOnly => "on disk only — NOT committed, run sync".into(),
+                        };
                         app.subject.clear();
                         app.body.clear();
                         app.scur = 0;

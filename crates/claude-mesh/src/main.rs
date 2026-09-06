@@ -387,6 +387,22 @@ fn sudo_target(git_user: Option<&str>, current: &str, exists: impl Fn(&str) -> b
         .map(|u| u.to_string())
 }
 
+/// Only root can hand a clone back to the account git runs as, and only when it
+/// actually escalates to a different user. Anything else must never chown a repo.
+fn should_heal_repo_ownership(current: &str, sudo_as: Option<&str>) -> bool {
+    current == "root" && sudo_as.is_some()
+}
+
+/// Repair the clone's ownership before git runs as someone else.
+/// Any root process that touches this repo — including a plain `git status`,
+/// which writes .git/index — leaves root-owned files that make every later
+/// git-as-paul call fail "Permission denied". That failure is what silently
+/// stranded messages, so heal it once per process rather than discovering it
+/// as a mystery later. Best-effort and idempotent.
+fn heal_repo_ownership(repo: &str, user: &str) {
+    let _ = Command::new("chown").arg("-R").arg(format!("{user}:{user}")).arg("--").arg(PathBuf::from(repo).join(".git")).status();
+}
+
 fn git(cfg: &Config, args: &[&str]) -> Result<String> {
     // `git_user` names the LOCAL unix account git should run as. Only escalate
     // with `sudo -u` when it is a real local user DIFFERENT from the current one
@@ -397,6 +413,12 @@ fn git(cfg: &Config, args: &[&str]) -> Result<String> {
     // cross-device nodes work; before, any non-local git_user hard-failed sudo.
     let cur = current_user();
     let sudo_as = sudo_target(cfg.git_user.as_deref(), &cur, user_exists);
+    // Once per process: make sure the account we're about to run git as can
+    // actually use the clone (see heal_repo_ownership).
+    static HEALED: std::sync::Once = std::sync::Once::new();
+    if should_heal_repo_ownership(&cur, sudo_as.as_deref()) {
+        HEALED.call_once(|| heal_repo_ownership(&cfg.repo, sudo_as.as_deref().unwrap_or_default()));
+    }
     let mut cmd = match sudo_as.as_deref() {
         Some(u) => {
             let mut c = Command::new("sudo");
@@ -574,6 +596,50 @@ fn commit(cfg: &Config, msg: &str) -> Result<String> {
     git(cfg, &["-c", &format!("user.name={}", cfg.id), "-c", "user.email=mesh@plausiden.com", "commit", "-q", "-m", msg])
 }
 
+/// How far a written message actually got. `post`/`register` must never claim
+/// more than this: a message that only reached disk is NOT in git history and
+/// will not propagate to any other node until something commits it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Delivery {
+    OnDiskOnly,
+    Committed,
+    Pushed,
+}
+
+fn delivery_status(d: Delivery) -> String {
+    match d {
+        // Loud, and it names the exact recovery — a silent "local commit" here
+        // is how two messages were lost without anyone noticing (2026-08-07).
+        Delivery::OnDiskOnly => "readable on this host but NOT committed — run: claude-mesh sync".into(),
+        Delivery::Committed => "committed locally, not pushed — run: claude-mesh sync".into(),
+        Delivery::Pushed => "pushed".into(),
+    }
+}
+
+/// Hand a file we just wrote to the account git runs as. When the tool runs as
+/// root but git runs via `sudo -u paul`, root's umask leaves the file
+/// root:root 0640 — paul cannot even read it, so `git add` fails and the
+/// message never enters history. Chown + 0644 is what makes the write usable
+/// by the committer. Best-effort: the bytes are already delivered on disk, so a
+/// failed handoff must never abort the post.
+fn share_with_git_user<F>(path: &Path, sudo_as: Option<&str>, chown: F)
+where
+    F: Fn(&Path, &str) -> std::io::Result<()>,
+{
+    if let Some(user) = sudo_as {
+        let _ = chown(path, user);
+    }
+}
+
+/// Real chown+chmod used in production (tests inject their own recorder).
+fn chown_to(path: &Path, user: &str) -> std::io::Result<()> {
+    // `--` so a path can never be read as an option (belt-and-braces: our names
+    // always start with a timestamp, but this stops the class outright).
+    let ok = Command::new("chown").arg(format!("{user}:{user}")).arg("--").arg(path).status()?.success();
+    let _ = Command::new("chmod").arg("644").arg("--").arg(path).status();
+    if ok { Ok(()) } else { Err(std::io::Error::other("chown failed")) }
+}
+
 fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>, repo_ctx: Option<String>, room: Option<String>, local: bool) -> Result<()> {
     let cfg = load_config()?;
     let mut body = String::new();
@@ -595,11 +661,11 @@ fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>
         ext: empty_obj(),
         sig: None,
     };
-    let pushed = write_and_push(&cfg, m, local)?;
+    let delivery = write_and_push(&cfg, m, local)?;
     if local {
         println!("posted {} -> {} (local only)", &id[..8], to_disp);
     } else {
-        println!("posted {} -> {} ({})", &id[..8], to_disp, if pushed { "pushed" } else { "local commit — run: claude-mesh sync" });
+        println!("posted {} -> {} ({})", &id[..8], to_disp, delivery_status(delivery));
     }
     heartbeat(&cfg); // any activity refreshes presence (throttled inside)
     Ok(())
@@ -608,7 +674,7 @@ fn cmd_post(to: String, kind: String, subject: String, reference: Option<String>
 /// Sign, write (fast local bus + durable repo bus), and — unless `local` — commit
 /// and push a message. Returns whether the push landed. Shared by `post`, `mesh-say`,
 /// and the live monitor's compose line so all three write bytes identically.
-fn write_and_push(cfg: &Config, mut m: Message, local: bool) -> Result<bool> {
+fn write_and_push(cfg: &Config, mut m: Message, local: bool) -> Result<Delivery> {
     // Sign (Ed25519) so recipients can verify it's really from us.
     if let Ok(sk) = ensure_signing_key() {
         m.sig = Some(hex::encode(sk.sign(&signable_bytes(&m)).to_bytes()));
@@ -621,25 +687,29 @@ fn write_and_push(cfg: &Config, mut m: Message, local: bool) -> Result<bool> {
     fs::create_dir_all(&repo_bus)?;
     fs::write(repo_bus.join(&fname), &json)?; // durable copy in the shared repo
     if local {
-        return Ok(false);
+        return Ok(Delivery::OnDiskOnly);
     }
     let rel = format!("bus/{fname}");
+    // The committer may be a DIFFERENT unix account (root writes, paul commits) —
+    // hand it the file or `git add` cannot read it and the message never enters
+    // history despite sitting on disk.
+    share_with_git_user(&repo_bus.join(&fname), sudo_target(cfg.git_user.as_deref(), &current_user(), user_exists).as_deref(), chown_to);
     // From here the message is durably on disk in BOTH buses — it IS delivered
     // locally and readable by every same-host session. Git trouble (locked index,
     // hook, sudo config) must therefore NOT surface as Err: a caller that retried
-    // on "error" would write a SECOND copy. Report "not pushed" instead; the next
-    // `sync`/post/archive sweeps it up.
+    // on "error" would write a SECOND copy. Report the REAL state instead; `sync`
+    // sweeps up anything left uncommitted.
     if git(cfg, &["add", &rel]).is_err() || commit(cfg, &format!("msg: {}", m.subject)).is_err() {
-        return Ok(false);
+        return Ok(Delivery::OnDiskOnly);
     }
     let _ = git_ok(cfg, &["pull", "--rebase", "--autostash"]);
-    Ok(git_ok(cfg, &["push"]))
+    Ok(if git_ok(cfg, &["push"]) { Delivery::Pushed } else { Delivery::Committed })
 }
 
 /// Post a line typed into the live monitor. If this node is the owner, it's stamped
 /// `authority=owner` (kind=directive) so sessions treat it as Paul's word; otherwise
 /// it posts as a normal `say` from this node — never a session impersonating the owner.
-fn send_from_monitor(cfg: &Config, to: &str, room: &str, subject: &str, body: &str) -> Result<bool> {
+fn send_from_monitor(cfg: &Config, to: &str, room: &str, subject: &str, body: &str) -> Result<Delivery> {
     let owner = cfg.role == "owner";
     // Use the typed subject; if left blank, derive one from the body (same as before).
     let subject = if subject.trim().is_empty() {
@@ -716,12 +786,85 @@ fn cmd_ack(id: Option<String>, all: bool) -> Result<()> {
     Ok(())
 }
 
+/// Mesh data files left uncommitted in the clone, from `git status --porcelain`.
+/// ONLY bus/ and nodes/ — everything else in a shared clone belongs to someone
+/// else and must never be swept into our commit. Renames/quoted paths are left
+/// for a human rather than turned into a wrong pathspec.
+fn pending_mesh_paths(porcelain: &str, my_node_file: &str) -> Vec<String> {
+    porcelain
+        .lines()
+        .filter(|l| l.len() > 3)
+        .filter(|l| !l.starts_with('R') && !l[..2].contains('R'))
+        .map(|l| l[3..].trim())
+        .filter(|p| !p.starts_with('"') && !p.contains(" -> "))
+        .filter(|p| {
+            // any node's bus message (append-only, immutable once written)…
+            (p.starts_with("bus/") && p.ends_with(".json"))
+                // …but only OUR node file: a peer rewrites theirs on every
+                // heartbeat, and committing it mid-write is their state to own.
+                || (p.starts_with("nodes/")
+                    && (p.ends_with(".json") || p.ends_with(".status"))
+                    && p.trim_start_matches("nodes/").starts_with(my_node_file))
+        })
+        .map(|p| p.to_string())
+        .collect()
+}
+
 fn cmd_sync() -> Result<()> {
     let cfg = load_config()?;
+    // Sweep first: a message whose commit failed (e.g. the file was written by
+    // root but git runs as paul) is on disk yet invisible to every other node.
+    // `post` tells the operator to run sync — so sync must actually rescue it.
+    // If we cannot even READ the tree state, say so — silently treating that as
+    // "nothing pending" is precisely how stranded messages stayed invisible.
+    let porcelain = match git(&cfg, &["status", "--porcelain"]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sync: cannot read repo state, sweep skipped — {}", first_line(&e.to_string()));
+            String::new()
+        }
+    };
+    let pending = pending_mesh_paths(&porcelain, &sanitize(&cfg.id));
+    let mut swept = 0usize;
+    if !pending.is_empty() {
+        let sudo_as = sudo_target(cfg.git_user.as_deref(), &current_user(), user_exists);
+        for rel in &pending {
+            share_with_git_user(&PathBuf::from(&cfg.repo).join(rel), sudo_as.as_deref(), chown_to);
+        }
+        // Add one at a time: a single vanished path (another session archiving
+        // concurrently) must not abort the rescue of every other message.
+        let added = pending.iter().filter(|rel| git(&cfg, &["add", rel]).is_ok()).count();
+        if added > 0 && commit(&cfg, &format!("mesh: sweep {added} uncommitted file(s)")).is_ok() {
+            swept = added;
+        }
+    }
     let pulled = git_ok(&cfg, &["pull", "--rebase", "--autostash"]);
-    let pushed = git_ok(&cfg, &["push"]);
-    println!("sync: pull {} push {}", if pulled { "ok" } else { "skip" }, if pushed { "ok" } else { "skip" });
+    // Report the push HONESTLY: a failure (403, no remote, rejected) is the
+    // channel being down, not a no-op worth calling "skip".
+    let push = git(&cfg, &["push"]);
+    // Only claim a backlog count we actually measured — with no upstream the
+    // query itself fails, and printing "0 unsent" there would be a fresh lie.
+    let backlog = git(&cfg, &["log", "--oneline", "@{u}..HEAD"])
+        .map(|s| s.lines().filter(|l| !l.trim().is_empty()).count());
+    let detail = match &push {
+        Ok(_) => String::new(),
+        Err(e) => match &backlog {
+            Ok(n) => format!(" ({n} local commit(s) still unsent) — {}", first_line(&e.to_string())),
+            Err(_) => format!(" (no upstream branch) — {}", first_line(&e.to_string())),
+        },
+    };
+    println!(
+        "sync: pull {} · swept {} · push {}{}",
+        if pulled { "ok" } else { "skip" },
+        swept,
+        if push.is_ok() { "ok" } else { "FAILED" },
+        detail,
+    );
     Ok(())
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().last().unwrap_or(s).chars().take(160).collect()
 }
 
 fn cmd_archive(older_than_days: i64, keep: usize, dry_run: bool) -> Result<()> {
@@ -1155,6 +1298,130 @@ mod tests {
     #[test]
     fn empty_git_user_no_sudo() {
         assert_eq!(sudo_target(Some(""), "root", exists), None);
+    }
+
+    use super::{delivery_status, Delivery};
+    use std::cell::RefCell;
+
+    // A message that reached the shared bus but whose commit failed must NEVER
+    // read as committed: two of these were silently lost on prime 2026-08-07
+    // because root-written files (root:root 0640) were unreadable by the paul
+    // git user, the commit failed, and post still printed "local commit".
+    #[test]
+    fn uncommitted_says_so_and_names_the_recovery() {
+        let s = delivery_status(Delivery::OnDiskOnly);
+        assert!(s.contains("NOT committed"), "{s}");
+        assert!(s.contains("sync"), "{s}"); // must name the command that fixes it
+    }
+    #[test]
+    fn committed_but_unpushed_is_distinct_from_uncommitted() {
+        let c = delivery_status(Delivery::Committed);
+        assert!(c.contains("committed"), "{c}");
+        assert!(!c.contains("NOT committed"), "{c}");
+        assert_ne!(c, delivery_status(Delivery::OnDiskOnly));
+    }
+    #[test]
+    fn pushed_is_its_own_state() {
+        assert_eq!(delivery_status(Delivery::Pushed), "pushed");
+    }
+
+    use super::share_with_git_user;
+    // Files this tool writes as root must be handed to the git user, or
+    // `git add` (running via sudo -u paul) cannot read them at all.
+    #[test]
+    fn root_written_file_is_handed_to_the_git_user() {
+        let calls = RefCell::new(Vec::new());
+        share_with_git_user(std::path::Path::new("/x/bus/m.json"), Some("paul"), |p, u| {
+            calls.borrow_mut().push((p.to_string_lossy().to_string(), u.to_string()));
+            Ok(())
+        });
+        assert_eq!(calls.into_inner(), vec![("/x/bus/m.json".to_string(), "paul".to_string())]);
+    }
+    #[test]
+    fn no_escalation_means_no_chown() {
+        let calls = RefCell::new(0);
+        share_with_git_user(std::path::Path::new("/x/bus/m.json"), None, |_, _| {
+            *calls.borrow_mut() += 1;
+            Ok(())
+        });
+        assert_eq!(calls.into_inner(), 0); // same user already owns it
+    }
+    #[test]
+    fn chown_failure_is_swallowed_not_fatal() {
+        // delivery already happened on disk; a failed handoff must not panic
+        share_with_git_user(std::path::Path::new("/x/m.json"), Some("paul"), |_, _| {
+            Err(std::io::Error::other("nope"))
+        });
+    }
+
+    use super::should_heal_repo_ownership;
+    // A root process touching a paul-owned clone re-roots .git/index (even a
+    // plain `git status` writes it), after which every git-as-paul call dies
+    // "Permission denied" — that is how the sweep silently swept nothing.
+    #[test]
+    fn root_tool_with_paul_git_user_heals() {
+        assert!(should_heal_repo_ownership("root", Some("paul")));
+    }
+    #[test]
+    fn non_root_never_chowns_someone_elses_repo() {
+        assert!(!should_heal_repo_ownership("paul", Some("admin")));
+    }
+    #[test]
+    fn no_escalation_no_heal() {
+        assert!(!should_heal_repo_ownership("root", None));
+    }
+
+    use super::pending_mesh_paths;
+    // `sync` is documented as the recovery for an uncommitted message, so it has
+    // to actually SEE one. Porcelain marks untracked with '??' and modified ' M'.
+    #[test]
+    fn sweeps_untracked_and_modified_mesh_files() {
+        // exactly as `git status --porcelain` emits it: 2 status chars + space
+        let porcelain = concat!(
+            "?? bus/20260807T003124Z-governor-prime-eae77914-044d7431.json\n",
+            "?? .claude/\n",
+            " M nodes/governor-prime-eae77914.status\n",
+            "?? notes/scratch.txt\n",
+        );
+        let mut got = pending_mesh_paths(porcelain, "governor-prime-eae77914");
+        got.sort();
+        assert_eq!(got, vec![
+            "bus/20260807T003124Z-governor-prime-eae77914-044d7431.json".to_string(),
+            "nodes/governor-prime-eae77914.status".to_string(),
+        ]);
+    }
+    #[test]
+    fn ignores_unrelated_paths_so_sync_never_commits_someone_elses_work() {
+        // only bus/ and nodes/ are mesh data; anything else in the clone is not
+        // ours to commit (another session's scratch, .claude/, docs edits).
+        assert!(pending_mesh_paths("?? docs/DESIGN.md\n M MESH-PROTOCOL.md\n", "me").is_empty());
+    }
+    #[test]
+    fn rescues_any_nodes_bus_message_but_only_my_own_status() {
+        // bus messages are append-only and immutable once written — safe to
+        // rescue for any node. A peer's nodes/*.status is rewritten on every
+        // heartbeat; committing it mid-write is someone else's state to manage.
+        let porcelain = concat!(
+            "?? bus/20260807T0000Z-governor-prime-peer99-aaaaaaaa.json\n",
+            " M nodes/governor-prime-peer99.status\n",
+            " M nodes/governor-prime-me.status\n",
+        );
+        let mut got = pending_mesh_paths(porcelain, "governor-prime-me");
+        got.sort();
+        assert_eq!(got, vec![
+            "bus/20260807T0000Z-governor-prime-peer99-aaaaaaaa.json".to_string(),
+            "nodes/governor-prime-me.status".to_string(),
+        ]);
+    }
+    #[test]
+    fn clean_tree_has_nothing_to_sweep() {
+        assert!(pending_mesh_paths("", "me").is_empty());
+    }
+    #[test]
+    fn renamed_and_quoted_paths_are_skipped_not_mangled() {
+        // porcelain quotes paths with spaces and uses 'R  old -> new'; taking the
+        // raw tail would produce a bogus pathspec, so leave those to a human.
+        assert!(pending_mesh_paths("R  bus/a.json -> bus/b.json\n", "me").is_empty());
     }
 
     use super::select_archive;
