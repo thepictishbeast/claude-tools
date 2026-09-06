@@ -91,11 +91,23 @@ for path in sorted(glob.glob(log + "*")):
             # ?ref= tag — reliable, because it does not depend on the
             # browser choosing to send anything.
             q = parse_qs(urlsplit(uri).query)
-            for key in ("ref", "utm_source"):
+            # Three spellings, one meaning. `?ref=` is what this estate
+            # emitted first; `?from=` + `?at=` is the convention the
+            # sacred.vote session shipped and the one everything is
+            # converging on, because it also records WHICH placement was
+            # clicked. utm_source is what a third party will send.
+            #
+            # The receiver stays liberal on purpose: narrowing it would
+            # silently discard every click already emitted under the old
+            # spelling, and a migration that loses its own history is not
+            # worth running.
+            for key in ("ref", "from", "utm_source"):
                 for v in q.get(key, []):
                     if v:
-                        tags[v] += 1
-                        landing[v][urlsplit(uri).path] += 1
+                        at = (q.get("at") or [""])[0]
+                        label = f"{v}:{at}" if at else v
+                        tags[label] += 1
+                        landing[label][urlsplit(uri).path] += 1
 
             hdrs = req.get("headers", {}) or {}
             for k, v in hdrs.items():
