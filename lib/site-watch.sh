@@ -99,9 +99,18 @@ while read -r host slug path expect _rest; do
       # message, which is right for alerts and wrong for a heartbeat —
       # a heartbeat that gets deduplicated into silence is not a
       # heartbeat. Varying the body makes each one genuinely new.
-      printf 'Healthy at %s — HTTP %s on %s%s\n\nThis is the periodic check-in. If this topic goes quiet for more than a week, the monitor itself has stopped.\n' \
-        "$(date -u '+%Y-%m-%d %H:%M UTC')" "$code" "$host" "$path" \
-        | "$NOTIFY" --key "beat:$host" --title "$host ok" \
+      # Say what was actually checked and what the answer was, so the
+      # check-in carries evidence rather than just the word "ok". A
+      # reassurance you cannot verify is worth very little — and if the
+      # certificate figure starts falling week on week, that is visible
+      # here before it becomes an alert.
+      cert_line="certificate could not be read"
+      if [ -n "${end:-}" ] && [ "${end_s:-0}" -gt 0 ]; then
+        cert_line="certificate good for $(( (end_s - $(date +%s)) / 86400 )) more days"
+      fi
+      printf 'Responding normally.\n\n  checked   https://%s%s\n  answered  HTTP %s\n  TLS       %s\n  at        %s\n\nThis is the weekly check-in, not an alert. It means the monitor itself is alive: if this topic goes quiet for more than a week, something has stopped watching.\n' \
+        "$host" "$path" "$code" "$cert_line" "$(date -u '+%a %d %b, %H:%M UTC')" \
+        | "$NOTIFY" --key "beat:$host" --title "$host — all good" \
             --priority min --tags heavy_check_mark --topic "plausiden-$slug" >/dev/null 2>&1
     fi
   fi
